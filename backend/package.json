@@ -1,6 +1,7 @@
 {
   "name": "khabar-backend",
   "version": "1.0.0",
+  "type": "module",
   "description": "Crime and safety reporting API",
   "main": "dist/server.js",
   "scripts": {
