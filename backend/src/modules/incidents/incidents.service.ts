@@ -1,681 +1,569 @@
-import { prisma } from '../../config/database.js';
-import { config } from '../../config/index.js';
-import { NotFoundError, ForbiddenError } from '../../utils/errors.js';
-import { kmToMeters, getBoundingBox, sanitizeRadius } from '../../utils/geo.js';
-import { getSkip, paginate, type PaginationParams } from '../../utils/pagination.js';
-import type {
-  CreateIncidentInput,
-  UpdateIncidentInput,
-  NearbyIncidentsQuery,
-  MapIncidentsQuery,
-  ListIncidentsQuery,
-  AddUpdateInput,
-} from './incidents.schema.js';
+import {
+  Injectable,
+  NotFoundException,
+  ForbiddenException,
+  BadRequestException,
+  Logger,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { PrismaService } from '../prisma/prisma.service';
+import { ReputationService } from '../reputation/reputation.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import {
+  CreateIncidentDto,
+  UpdateIncidentDto,
+  NearbyIncidentsDto,
+  BoundingBoxDto,
+  VoteDto,
+} from './dto/incidents.dto';
+import {
+  Incident,
+  IncidentStatus,
+  VoteType,
+  User,
+  ReputationAction,
+} from '@prisma/client';
+import { addHours } from 'date-fns';
 
-export class IncidentService {
+interface IncidentWithDistance extends Incident {
+  distance_meters?: number;
+  category_name?: string;
+  category_icon?: string;
+  category_color?: string;
+}
+
+@Injectable()
+export class IncidentsService {
+  private readonly logger = new Logger(IncidentsService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly configService: ConfigService,
+    private readonly reputationService: ReputationService,
+    private readonly notificationsService: NotificationsService,
+  ) {}
+
   /**
    * Create a new incident
    */
-  async createIncident(userId: string, data: CreateIncidentInput) {
-    // Calculate expiry time
-    const expiresAt = new Date();
-    expiresAt.setHours(expiresAt.getHours() + config.incidents.expiryHours);
+  async create(dto: CreateIncidentDto, user: User): Promise<Incident> {
+    // Validate category exists
+    const category = await this.prisma.category.findUnique({
+      where: { id: dto.categoryId },
+    });
 
-    const incident = await prisma.incident.create({
+    if (!category || !category.isActive) {
+      throw new BadRequestException('Invalid category');
+    }
+
+    // Calculate expiry time
+    const expiryHours = this.configService.get<number>('incidents.expiryHours') || 24;
+    const expiresAt = addHours(new Date(), expiryHours);
+
+    // Create incident
+    const incident = await this.prisma.incident.create({
       data: {
-        userId,
-        categoryId: data.categoryId,
-        title: data.title,
-        description: data.description,
-        latitude: data.latitude,
-        longitude: data.longitude,
-        address: data.address,
-        city: data.city,
-        neighborhood: data.neighborhood,
-        severity: data.severity,
-        isAnonymous: data.isAnonymous,
+        userId: user.id,
+        categoryId: dto.categoryId,
+        title: dto.title,
+        description: dto.description,
+        latitude: dto.latitude,
+        longitude: dto.longitude,
+        address: dto.address,
+        city: dto.city,
+        neighborhood: dto.neighborhood,
+        postalCode: dto.postalCode,
+        severity: dto.severity,
+        isAnonymous: dto.isAnonymous || false,
         expiresAt,
-        status: config.features.requireModeration ? 'PENDING' : 'VERIFIED',
+        verificationThreshold:
+          this.configService.get<number>('incidents.verificationThreshold') || 3,
       },
       include: {
         category: true,
         user: {
           select: {
             id: true,
-            username: true,
             displayName: true,
+            username: true,
             avatarUrl: true,
             reputationScore: true,
+            isVerifiedUser: true,
           },
         },
       },
     });
 
-    // Update user's reports count
-    await prisma.user.update({
-      where: { id: userId },
+    // Update user's report count
+    await this.prisma.user.update({
+      where: { id: user.id },
       data: { reportsCount: { increment: 1 } },
     });
 
-    // Add to moderation queue if moderation is required
-    if (config.features.requireModeration) {
-      await prisma.moderationQueue.create({
-        data: {
-          contentType: 'INCIDENT',
-          contentId: incident.id,
-          reason: 'NEW_CONTENT',
-          priority: this.getSeverityPriority(data.severity),
-        },
-      });
-    }
-
-    return this.formatIncident(incident);
-  }
-
-  /**
-   * Get nearby incidents using geospatial query
-   */
-  async getNearbyIncidents(query: NearbyIncidentsQuery) {
-    const radiusKm = sanitizeRadius(query.radius);
-    const radiusMeters = kmToMeters(radiusKm);
-
-    // Use bounding box for initial filter (more efficient)
-    const bbox = getBoundingBox(
-      { latitude: query.latitude, longitude: query.longitude },
-      radiusKm
+    // Award reputation points
+    await this.reputationService.adjustReputation(
+      user.id,
+      ReputationAction.INCIDENT_CREATED,
+      'INCIDENT',
+      incident.id,
     );
 
-    const whereClause: Record<string, unknown> = {
-      status: query.status ?? { in: ['PENDING', 'VERIFIED'] },
-      latitude: { gte: bbox.minLat, lte: bbox.maxLat },
-      longitude: { gte: bbox.minLng, lte: bbox.maxLng },
+    // Notify nearby users
+    this.notifyNearbyUsers(incident).catch((err) => {
+      this.logger.error('Failed to notify nearby users:', err);
+    });
+
+    this.logger.log(`Incident created: ${incident.id} by user ${user.id}`);
+
+    return incident;
+  }
+
+  /**
+   * Get incidents within a radius (PostGIS ST_DWithin)
+   */
+  async findNearby(
+    dto: NearbyIncidentsDto,
+  ): Promise<{ incidents: IncidentWithDistance[]; total: number }> {
+    const maxRadius =
+      this.configService.get<number>('geo.maxSearchRadiusKm') || 50;
+    const radiusKm = Math.min(dto.radiusKm || 5, maxRadius);
+
+    const status = dto.status || [
+      IncidentStatus.PENDING,
+      IncidentStatus.VERIFIED,
+    ];
+
+    const incidents = (await this.prisma.findIncidentsWithinRadius(
+      dto.latitude,
+      dto.longitude,
+      radiusKm,
+      {
+        status: status as string[],
+        categoryId: dto.categoryId,
+        limit: dto.limit || 50,
+        offset: dto.offset || 0,
+      },
+    )) as IncidentWithDistance[];
+
+    return {
+      incidents,
+      total: incidents.length,
     };
+  }
 
-    if (query.category) {
-      whereClause['categoryId'] = query.category;
-    }
+  /**
+   * Get incidents within a bounding box (for map view)
+   */
+  async findInBoundingBox(
+    dto: BoundingBoxDto,
+  ): Promise<IncidentWithDistance[]> {
+    const status = dto.status || [
+      IncidentStatus.PENDING,
+      IncidentStatus.VERIFIED,
+    ];
 
-    if (query.severity) {
-      whereClause['severity'] = query.severity;
-    }
+    return this.prisma.findIncidentsInBoundingBox(
+      dto.minLat,
+      dto.minLng,
+      dto.maxLat,
+      dto.maxLng,
+      {
+        status: status as string[],
+        limit: dto.limit || 100,
+      },
+    ) as Promise<IncidentWithDistance[]>;
+  }
 
-    if (query.since) {
-      whereClause['createdAt'] = { gte: query.since };
-    }
-
-    // Get incidents within bounding box
-    const incidents = await prisma.incident.findMany({
-      where: whereClause,
+  /**
+   * Get a single incident by ID
+   */
+  async findOne(id: string, userId?: string): Promise<Incident> {
+    const incident = await this.prisma.incident.findUnique({
+      where: { id },
       include: {
         category: true,
         user: {
           select: {
             id: true,
-            username: true,
             displayName: true,
-            avatarUrl: true,
-          },
-        },
-        _count: {
-          select: {
-            comments: true,
-            media: true,
-          },
-        },
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 100, // Limit for performance
-    });
-
-    // Calculate actual distances and filter precisely
-    const incidentsWithDistance = incidents
-      .map((incident) => {
-        const distance = this.calculateDistance(
-          query.latitude,
-          query.longitude,
-          Number(incident.latitude),
-          Number(incident.longitude)
-        );
-        return { ...this.formatIncident(incident), distance };
-      })
-      .filter((inc) => inc.distance <= radiusKm)
-      .sort((a, b) => a.distance - b.distance);
-
-    return incidentsWithDistance;
-  }
-
-  /**
-   * Get incidents for map view (within bounds)
-   */
-  async getMapIncidents(query: MapIncidentsQuery) {
-    const whereClause: Record<string, unknown> = {
-      status: query.status ?? { in: ['PENDING', 'VERIFIED'] },
-      latitude: { gte: query.minLat, lte: query.maxLat },
-      longitude: { gte: query.minLng, lte: query.maxLng },
-    };
-
-    if (query.categories) {
-      const categoryIds = query.categories.split(',').filter(Boolean);
-      if (categoryIds.length > 0) {
-        whereClause['categoryId'] = { in: categoryIds };
-      }
-    }
-
-    const incidents = await prisma.incident.findMany({
-      where: whereClause,
-      select: {
-        id: true,
-        title: true,
-        latitude: true,
-        longitude: true,
-        severity: true,
-        status: true,
-        createdAt: true,
-        category: {
-          select: {
-            id: true,
-            name: true,
-            slug: true,
-            icon: true,
-            color: true,
-          },
-        },
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 200, // Limit for map performance
-    });
-
-    return incidents.map((inc) => ({
-      ...inc,
-      latitude: Number(inc.latitude),
-      longitude: Number(inc.longitude),
-    }));
-  }
-
-  /**
-   * List incidents with filters and pagination
-   */
-  async listIncidents(query: ListIncidentsQuery) {
-    const whereClause: Record<string, unknown> = {};
-
-    if (query.category) {
-      whereClause['categoryId'] = query.category;
-    }
-
-    if (query.status) {
-      whereClause['status'] = query.status;
-    } else {
-      whereClause['status'] = { in: ['PENDING', 'VERIFIED'] };
-    }
-
-    if (query.severity) {
-      whereClause['severity'] = query.severity;
-    }
-
-    if (query.userId) {
-      whereClause['userId'] = query.userId;
-    }
-
-    const [incidents, total] = await Promise.all([
-      prisma.incident.findMany({
-        where: whereClause,
-        include: {
-          category: true,
-          user: {
-            select: {
-              id: true,
-              username: true,
-              displayName: true,
-              avatarUrl: true,
-            },
-          },
-          _count: {
-            select: {
-              comments: true,
-              media: true,
-            },
-          },
-        },
-        orderBy: { [query.sortBy]: query.sortOrder },
-        skip: getSkip(query.page, query.limit),
-        take: query.limit,
-      }),
-      prisma.incident.count({ where: whereClause }),
-    ]);
-
-    return paginate(incidents.map(this.formatIncident), total, {
-      page: query.page,
-      limit: query.limit,
-      sortOrder: query.sortOrder,
-    } as PaginationParams);
-  }
-
-  /**
-   * Get single incident by ID
-   */
-  async getIncident(incidentId: string, viewerId?: string) {
-    const incident = await prisma.incident.findUnique({
-      where: { id: incidentId },
-      include: {
-        category: true,
-        user: {
-          select: {
-            id: true,
             username: true,
-            displayName: true,
             avatarUrl: true,
             reputationScore: true,
+            isVerifiedUser: true,
           },
         },
         media: {
           where: { moderationStatus: 'APPROVED' },
           orderBy: { isPrimary: 'desc' },
         },
-        updates: {
-          orderBy: { createdAt: 'desc' },
-          take: 10,
-          include: {
-            user: {
-              select: {
-                id: true,
-                username: true,
-                displayName: true,
-              },
-            },
-          },
-        },
         _count: {
-          select: {
-            comments: true,
-            votes: true,
-          },
+          select: { comments: true, votes: true },
         },
       },
     });
 
     if (!incident) {
-      throw new NotFoundError('Incident not found');
+      throw new NotFoundException('Incident not found');
     }
 
     // Increment view count
-    await prisma.incident.update({
-      where: { id: incidentId },
+    await this.prisma.incident.update({
+      where: { id },
       data: { viewsCount: { increment: 1 } },
     });
 
-    // Check if viewer has voted
-    let userVote = null;
-    if (viewerId) {
-      const vote = await prisma.vote.findUnique({
-        where: {
-          userId_incidentId: {
-            userId: viewerId,
-            incidentId,
-          },
-        },
+    // Get user's vote if logged in
+    if (userId) {
+      const userVote = await this.prisma.vote.findUnique({
+        where: { userId_incidentId: { userId, incidentId: id } },
       });
-      userVote = vote?.voteType ?? null;
+      (incident as Incident & { userVote?: VoteType }).userVote = userVote?.voteType;
     }
 
-    return {
-      ...this.formatIncident(incident),
-      media: incident.media,
-      updates: incident.updates,
-      userVote,
-    };
+    return incident;
   }
 
   /**
    * Update an incident
    */
-  async updateIncident(
-    incidentId: string,
-    userId: string,
-    data: UpdateIncidentInput,
-    isAdmin = false
-  ) {
-    const incident = await prisma.incident.findUnique({
-      where: { id: incidentId },
+  async update(
+    id: string,
+    dto: UpdateIncidentDto,
+    user: User,
+  ): Promise<Incident> {
+    const incident = await this.prisma.incident.findUnique({
+      where: { id },
     });
 
     if (!incident) {
-      throw new NotFoundError('Incident not found');
+      throw new NotFoundException('Incident not found');
     }
 
     // Only owner or admin can update
-    if (incident.userId !== userId && !isAdmin) {
-      throw new ForbiddenError('You can only update your own incidents');
+    if (incident.userId !== user.id && user.role !== 'ADMIN') {
+      throw new ForbiddenException('Not authorized to update this incident');
     }
 
-    const updated = await prisma.incident.update({
-      where: { id: incidentId },
-      data: {
-        title: data.title,
-        description: data.description,
-        severity: data.severity,
-      },
+    // Verified/resolved incidents cannot be updated except by admin
+    if (
+      incident.status !== IncidentStatus.PENDING &&
+      user.role !== 'ADMIN'
+    ) {
+      throw new ForbiddenException('Cannot update a verified or resolved incident');
+    }
+
+    return this.prisma.incident.update({
+      where: { id },
+      data: dto,
       include: {
         category: true,
         user: {
           select: {
             id: true,
-            username: true,
             displayName: true,
+            username: true,
             avatarUrl: true,
+            reputationScore: true,
           },
         },
       },
     });
+  }
 
-    return this.formatIncident(updated);
+  /**
+   * Vote on an incident (upvote, downvote, or verify)
+   */
+  async vote(id: string, dto: VoteDto, user: User): Promise<Incident> {
+    const incident = await this.prisma.incident.findUnique({
+      where: { id },
+      include: { user: true },
+    });
+
+    if (!incident) {
+      throw new NotFoundException('Incident not found');
+    }
+
+    // Cannot vote on own incident
+    if (incident.userId === user.id) {
+      throw new ForbiddenException('Cannot vote on your own incident');
+    }
+
+    // Cannot vote on expired/rejected incidents
+    if (
+      incident.status === IncidentStatus.EXPIRED ||
+      incident.status === IncidentStatus.REJECTED
+    ) {
+      throw new ForbiddenException('Cannot vote on this incident');
+    }
+
+    // Check for existing vote
+    const existingVote = await this.prisma.vote.findUnique({
+      where: { userId_incidentId: { userId: user.id, incidentId: id } },
+    });
+
+    await this.prisma.$transaction(async (tx) => {
+      if (existingVote) {
+        // Remove old vote effects
+        await this.reverseVoteEffects(tx, incident, existingVote.voteType);
+
+        if (existingVote.voteType === dto.voteType) {
+          // Same vote = remove vote
+          await tx.vote.delete({
+            where: { id: existingVote.id },
+          });
+          return;
+        }
+
+        // Update vote
+        await tx.vote.update({
+          where: { id: existingVote.id },
+          data: { voteType: dto.voteType },
+        });
+      } else {
+        // Create new vote
+        await tx.vote.create({
+          data: {
+            userId: user.id,
+            incidentId: id,
+            voteType: dto.voteType,
+          },
+        });
+      }
+
+      // Apply new vote effects
+      await this.applyVoteEffects(tx, incident, dto.voteType, user);
+    });
+
+    // Return updated incident
+    return this.prisma.incident.findUnique({
+      where: { id },
+      include: {
+        category: true,
+        _count: { select: { comments: true, votes: true } },
+      },
+    }) as Promise<Incident>;
+  }
+
+  /**
+   * Resolve an incident
+   */
+  async resolve(
+    id: string,
+    resolutionNote: string,
+    user: User,
+  ): Promise<Incident> {
+    const incident = await this.prisma.incident.findUnique({
+      where: { id },
+    });
+
+    if (!incident) {
+      throw new NotFoundException('Incident not found');
+    }
+
+    // Only owner, moderator, or admin can resolve
+    if (
+      incident.userId !== user.id &&
+      user.role !== 'ADMIN' &&
+      user.role !== 'MODERATOR'
+    ) {
+      throw new ForbiddenException('Not authorized to resolve this incident');
+    }
+
+    return this.prisma.incident.update({
+      where: { id },
+      data: {
+        status: IncidentStatus.RESOLVED,
+        resolvedAt: new Date(),
+        resolutionNote,
+      },
+      include: { category: true },
+    });
   }
 
   /**
    * Delete an incident
    */
-  async deleteIncident(incidentId: string, userId: string, isAdmin = false) {
-    const incident = await prisma.incident.findUnique({
-      where: { id: incidentId },
+  async remove(id: string, user: User): Promise<void> {
+    const incident = await this.prisma.incident.findUnique({
+      where: { id },
     });
 
     if (!incident) {
-      throw new NotFoundError('Incident not found');
+      throw new NotFoundException('Incident not found');
     }
 
     // Only owner or admin can delete
-    if (incident.userId !== userId && !isAdmin) {
-      throw new ForbiddenError('You can only delete your own incidents');
+    if (incident.userId !== user.id && user.role !== 'ADMIN') {
+      throw new ForbiddenException('Not authorized to delete this incident');
     }
 
-    await prisma.incident.delete({
-      where: { id: incidentId },
-    });
+    await this.prisma.incident.delete({ where: { id } });
 
-    // Decrement user's reports count
-    await prisma.user.update({
-      where: { id: incident.userId },
-      data: { reportsCount: { decrement: 1 } },
-    });
+    // Deduct reputation for deleted incident
+    if (incident.status === IncidentStatus.VERIFIED) {
+      await this.reputationService.adjustReputation(
+        incident.userId,
+        ReputationAction.INCIDENT_REJECTED,
+        'INCIDENT',
+        id,
+      );
+    }
   }
 
   /**
-   * Upvote an incident
+   * Get user's incidents
    */
-  async upvoteIncident(incidentId: string, userId: string) {
-    // Check if incident exists
-    const incident = await prisma.incident.findUnique({
-      where: { id: incidentId },
-    });
-
-    if (!incident) {
-      throw new NotFoundError('Incident not found');
-    }
-
-    // Check for existing vote
-    const existingVote = await prisma.vote.findUnique({
-      where: {
-        userId_incidentId: {
-          userId,
-          incidentId,
-        },
-      },
-    });
-
-    if (existingVote) {
-      // Remove vote
-      await prisma.vote.delete({
-        where: { id: existingVote.id },
-      });
-
-      await prisma.incident.update({
-        where: { id: incidentId },
-        data: { upvotesCount: { decrement: 1 } },
-      });
-
-      return { voted: false };
-    }
-
-    // Add vote
-    await prisma.vote.create({
-      data: {
-        userId,
-        incidentId,
-        voteType: 'UPVOTE',
-      },
-    });
-
-    await prisma.incident.update({
-      where: { id: incidentId },
-      data: { upvotesCount: { increment: 1 } },
-    });
-
-    return { voted: true };
-  }
-
-  /**
-   * Verify an incident
-   */
-  async verifyIncident(incidentId: string, userId: string) {
-    const incident = await prisma.incident.findUnique({
-      where: { id: incidentId },
-    });
-
-    if (!incident) {
-      throw new NotFoundError('Incident not found');
-    }
-
-    // Check for existing verify vote
-    const existingVote = await prisma.vote.findFirst({
-      where: {
-        userId,
-        incidentId,
-        voteType: 'VERIFY',
-      },
-    });
-
-    if (existingVote) {
-      return { verified: false, message: 'Already verified' };
-    }
-
-    // Add verify vote
-    await prisma.vote.create({
-      data: {
-        userId,
-        incidentId,
-        voteType: 'VERIFY',
-      },
-    });
-
-    // Count verify votes
-    const verifyCount = await prisma.vote.count({
-      where: {
-        incidentId,
-        voteType: 'VERIFY',
-      },
-    });
-
-    // Auto-verify after threshold (e.g., 3 verifications)
-    if (verifyCount >= 3 && incident.status === 'PENDING') {
-      await prisma.incident.update({
-        where: { id: incidentId },
-        data: {
-          status: 'VERIFIED',
-          verifiedAt: new Date(),
-          verifiedById: userId,
-        },
-      });
-
-      // Update reporter's verified count
-      await prisma.user.update({
-        where: { id: incident.userId },
-        data: {
-          verifiedReportsCount: { increment: 1 },
-          reputationScore: { increment: 5 },
-        },
-      });
-    }
-
-    return { verified: true, verifyCount };
-  }
-
-  /**
-   * Add an update to an incident
-   */
-  async addUpdate(
-    incidentId: string,
+  async findByUser(
     userId: string,
-    data: AddUpdateInput,
-    isAdmin = false
-  ) {
-    const incident = await prisma.incident.findUnique({
-      where: { id: incidentId },
-    });
-
-    if (!incident) {
-      throw new NotFoundError('Incident not found');
-    }
-
-    // Only owner or admin can add updates
-    if (incident.userId !== userId && !isAdmin) {
-      throw new ForbiddenError('You can only add updates to your own incidents');
-    }
-
-    const update = await prisma.incidentUpdate.create({
-      data: {
-        incidentId,
-        userId,
-        content: data.content,
-        updateType: data.updateType,
-      },
-      include: {
-        user: {
-          select: {
-            id: true,
-            username: true,
-            displayName: true,
-          },
-        },
-      },
-    });
-
-    return update;
-  }
-
-  /**
-   * Get incident updates
-   */
-  async getUpdates(incidentId: string, pagination: PaginationParams) {
-    const [updates, total] = await Promise.all([
-      prisma.incidentUpdate.findMany({
-        where: { incidentId },
-        include: {
-          user: {
-            select: {
-              id: true,
-              username: true,
-              displayName: true,
-              avatarUrl: true,
-            },
-          },
-        },
+    limit = 20,
+    offset = 0,
+  ): Promise<{ incidents: Incident[]; total: number }> {
+    const [incidents, total] = await Promise.all([
+      this.prisma.incident.findMany({
+        where: { userId },
         orderBy: { createdAt: 'desc' },
-        skip: getSkip(pagination.page, pagination.limit),
-        take: pagination.limit,
+        take: limit,
+        skip: offset,
+        include: {
+          category: true,
+          _count: { select: { comments: true, votes: true } },
+        },
       }),
-      prisma.incidentUpdate.count({ where: { incidentId } }),
+      this.prisma.incident.count({ where: { userId } }),
     ]);
 
-    return paginate(updates, total, pagination);
+    return { incidents, total };
   }
 
   /**
-   * Calculate distance between two points (Haversine)
+   * Apply vote effects (update counters and check verification)
    */
-  private calculateDistance(
-    lat1: number,
-    lng1: number,
-    lat2: number,
-    lng2: number
-  ): number {
-    const R = 6371; // Earth's radius in km
-    const dLat = this.toRad(lat2 - lat1);
-    const dLng = this.toRad(lng2 - lng1);
-    const a =
-      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-      Math.cos(this.toRad(lat1)) *
-        Math.cos(this.toRad(lat2)) *
-        Math.sin(dLng / 2) *
-        Math.sin(dLng / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return R * c;
-  }
+  private async applyVoteEffects(
+    tx: Parameters<Parameters<typeof this.prisma.$transaction>[0]>[0],
+    incident: Incident & { user: User },
+    voteType: VoteType,
+    voter: User,
+  ): Promise<void> {
+    const updateData: Record<string, unknown> = {};
 
-  private toRad(deg: number): number {
-    return deg * (Math.PI / 180);
-  }
+    switch (voteType) {
+      case VoteType.UPVOTE:
+        updateData.upvotesCount = { increment: 1 };
+        await this.reputationService.adjustReputation(
+          incident.userId,
+          ReputationAction.UPVOTE_RECEIVED,
+          'INCIDENT',
+          incident.id,
+        );
+        break;
 
-  private getSeverityPriority(severity: string): number {
-    switch (severity) {
-      case 'CRITICAL':
-        return 5;
-      case 'HIGH':
-        return 4;
-      case 'MEDIUM':
-        return 2;
-      case 'LOW':
-        return 1;
-      default:
-        return 2;
+      case VoteType.DOWNVOTE:
+        updateData.downvotesCount = { increment: 1 };
+        await this.reputationService.adjustReputation(
+          incident.userId,
+          ReputationAction.DOWNVOTE_RECEIVED,
+          'INCIDENT',
+          incident.id,
+        );
+        break;
+
+      case VoteType.VERIFY:
+        updateData.verifyCount = { increment: 1 };
+
+        // Check if verification threshold reached
+        const verifyCount = incident.verifyCount + 1;
+        if (
+          verifyCount >= incident.verificationThreshold &&
+          incident.status === IncidentStatus.PENDING
+        ) {
+          updateData.status = IncidentStatus.VERIFIED;
+          updateData.verifiedAt = new Date();
+          updateData.verifiedById = voter.id;
+
+          // Award reputation to incident creator
+          await this.reputationService.adjustReputation(
+            incident.userId,
+            ReputationAction.INCIDENT_VERIFIED,
+            'INCIDENT',
+            incident.id,
+          );
+
+          // Update verified reports count
+          await tx.user.update({
+            where: { id: incident.userId },
+            data: { verifiedReportsCount: { increment: 1 } },
+          });
+        }
+
+        // Award reputation to verifier
+        await this.reputationService.adjustReputation(
+          voter.id,
+          ReputationAction.VERIFY_RECEIVED,
+          'INCIDENT',
+          incident.id,
+        );
+        break;
     }
+
+    await tx.incident.update({
+      where: { id: incident.id },
+      data: updateData,
+    });
   }
 
-  private formatIncident(incident: {
-    id: string;
-    userId: string;
-    categoryId: string;
-    title: string;
-    description: string | null;
-    latitude: unknown;
-    longitude: unknown;
-    address: string | null;
-    city: string | null;
-    neighborhood: string | null;
-    status: string;
-    severity: string;
-    isAnonymous: boolean;
-    viewsCount: number;
-    upvotesCount: number;
-    commentsCount: number;
-    createdAt: Date;
-    updatedAt: Date;
-    category?: object;
-    user?: object;
-    _count?: {
-      comments?: number;
-      media?: number;
-      votes?: number;
-    };
-  }) {
-    return {
-      id: incident.id,
-      title: incident.title,
-      description: incident.description,
-      latitude: Number(incident.latitude),
-      longitude: Number(incident.longitude),
-      address: incident.address,
-      city: incident.city,
-      neighborhood: incident.neighborhood,
-      status: incident.status,
-      severity: incident.severity,
-      isAnonymous: incident.isAnonymous,
-      viewsCount: incident.viewsCount,
-      upvotesCount: incident.upvotesCount,
-      commentsCount: incident._count?.comments ?? incident.commentsCount,
-      mediaCount: incident._count?.media ?? 0,
-      createdAt: incident.createdAt,
-      updatedAt: incident.updatedAt,
-      category: incident.category,
-      user: incident.isAnonymous ? null : incident.user,
-    };
+  /**
+   * Reverse vote effects
+   */
+  private async reverseVoteEffects(
+    tx: Parameters<Parameters<typeof this.prisma.$transaction>[0]>[0],
+    incident: Incident,
+    voteType: VoteType,
+  ): Promise<void> {
+    const updateData: Record<string, unknown> = {};
+
+    switch (voteType) {
+      case VoteType.UPVOTE:
+        updateData.upvotesCount = { decrement: 1 };
+        break;
+      case VoteType.DOWNVOTE:
+        updateData.downvotesCount = { decrement: 1 };
+        break;
+      case VoteType.VERIFY:
+        updateData.verifyCount = { decrement: 1 };
+        break;
+    }
+
+    await tx.incident.update({
+      where: { id: incident.id },
+      data: updateData,
+    });
+  }
+
+  /**
+   * Notify users near the incident
+   */
+  private async notifyNearbyUsers(incident: Incident): Promise<void> {
+    const maxRadius =
+      this.configService.get<number>('geo.maxSearchRadiusKm') || 50;
+
+    const nearbyUsers = await this.prisma.findUsersWithinRadius(
+      Number(incident.latitude),
+      Number(incident.longitude),
+      maxRadius,
+    );
+
+    for (const nearbyUser of nearbyUsers) {
+      if (nearbyUser.userId === incident.userId) continue; // Don't notify creator
+
+      await this.notificationsService.sendNearbyIncidentNotification(
+        nearbyUser.userId,
+        incident,
+        nearbyUser.apnsToken || undefined,
+      );
+    }
+
+    this.logger.log(
+      `Notified ${nearbyUsers.length} users about incident ${incident.id}`,
+    );
   }
 }

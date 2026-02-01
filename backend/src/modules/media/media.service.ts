@@ -1,154 +1,152 @@
-import { prisma } from '../../config/database.js';
-import { config } from '../../config/index.js';
-import { StorageService } from './storage.service.js';
-import { BadRequestError, NotFoundError, ForbiddenError } from '../../utils/errors.js';
-import type { MultipartFile } from '@fastify/multipart';
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  ForbiddenException,
+  Logger,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { PrismaService } from '../prisma/prisma.service';
+import { StorageService } from './storage.service';
+import {
+  CreateMediaDto,
+  RequestUploadUrlDto,
+  ConfirmUploadDto,
+} from './dto/media.dto';
+import { User, MediaType, ModerationStatus } from '@prisma/client';
 
+@Injectable()
 export class MediaService {
-  private storageService: StorageService;
+  private readonly logger = new Logger(MediaService.name);
 
-  constructor() {
-    this.storageService = new StorageService();
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly configService: ConfigService,
+    private readonly storageService: StorageService,
+  ) {}
+
+  /**
+   * Request a presigned URL for direct upload from iOS
+   * This is the preferred method for iOS apps
+   */
+  async requestUploadUrl(dto: RequestUploadUrlDto, user: User) {
+    // Validate file type
+    const type = dto.contentType.startsWith('video/') ? 'video' : 'image';
+    if (!this.storageService.validateFileType(dto.contentType, type)) {
+      throw new BadRequestException(`Invalid ${type} type: ${dto.contentType}`);
+    }
+
+    // Validate file size
+    if (!this.storageService.validateFileSize(dto.fileSize, type)) {
+      const maxSize =
+        type === 'image'
+          ? this.configService.get<number>('media.maxImageSizeMb')
+          : this.configService.get<number>('media.maxVideoSizeMb');
+      throw new BadRequestException(
+        `File size exceeds maximum of ${maxSize}MB for ${type}`,
+      );
+    }
+
+    // Validate video duration if provided
+    if (type === 'video' && dto.durationSeconds) {
+      const maxDuration =
+        this.configService.get<number>('media.maxVideoDurationSeconds') || 60;
+      if (dto.durationSeconds > maxDuration) {
+        throw new BadRequestException(
+          `Video duration exceeds maximum of ${maxDuration} seconds`,
+        );
+      }
+    }
+
+    // Generate presigned URL
+    const presigned = await this.storageService.getPresignedUploadUrl(
+      dto.fileName,
+      {
+        contentType: dto.contentType,
+        expiresIn: 3600, // 1 hour
+      },
+    );
+
+    return {
+      uploadUrl: presigned.uploadUrl,
+      key: presigned.key,
+      publicUrl: presigned.publicUrl,
+      expiresAt: presigned.expiresAt,
+      instructions: {
+        method: 'PUT',
+        headers: {
+          'Content-Type': dto.contentType,
+        },
+      },
+    };
   }
 
   /**
-   * Upload media to an incident
+   * Confirm upload and create media record
    */
-  async uploadMedia(
-    incidentId: string,
-    userId: string,
-    file: MultipartFile
-  ) {
-    // Validate incident exists and user owns it
-    const incident = await prisma.incident.findUnique({
-      where: { id: incidentId },
+  async confirmUpload(dto: ConfirmUploadDto, user: User) {
+    // Verify incident exists and user has permission
+    const incident = await this.prisma.incident.findUnique({
+      where: { id: dto.incidentId },
     });
 
     if (!incident) {
-      throw new NotFoundError('Incident not found');
+      throw new NotFoundException('Incident not found');
     }
 
-    if (incident.userId !== userId) {
-      throw new ForbiddenError('You can only add media to your own incidents');
+    // Only incident owner can add media
+    if (incident.userId !== user.id) {
+      throw new ForbiddenException('Not authorized to add media to this incident');
     }
 
-    // Validate file type
-    const contentType = file.mimetype;
-    let mediaType: 'IMAGE' | 'VIDEO' | 'AUDIO';
+    // Determine media type
+    const mediaType = dto.mimeType?.startsWith('video/')
+      ? MediaType.VIDEO
+      : MediaType.IMAGE;
 
-    if (this.storageService.isAllowedImageType(contentType)) {
-      mediaType = 'IMAGE';
+    // Check if this is the first media (make it primary)
+    const existingMedia = await this.prisma.incidentMedia.count({
+      where: { incidentId: dto.incidentId },
+    });
 
-      // Check file size
-      const buffer = await file.toBuffer();
-      if (buffer.length > config.media.maxImageSizeMb * 1024 * 1024) {
-        throw new BadRequestError(
-          `Image size exceeds maximum of ${config.media.maxImageSizeMb}MB`
-        );
-      }
+    const media = await this.prisma.incidentMedia.create({
+      data: {
+        incidentId: dto.incidentId,
+        userId: user.id,
+        mediaType,
+        url: dto.publicUrl,
+        s3Key: dto.key,
+        s3Bucket: this.configService.get<string>('s3.bucketName'),
+        fileName: dto.fileName,
+        mimeType: dto.mimeType,
+        fileSize: dto.fileSize,
+        durationSeconds: dto.durationSeconds,
+        width: dto.width,
+        height: dto.height,
+        deviceModel: dto.deviceModel,
+        capturedAt: dto.capturedAt ? new Date(dto.capturedAt) : undefined,
+        isPrimary: existingMedia === 0,
+        moderationStatus: ModerationStatus.PENDING,
+      },
+    });
 
-      // Upload file
-      const result = await this.storageService.uploadFile(
-        buffer,
-        file.filename,
-        contentType,
-        `incidents/${incidentId}`
-      );
+    this.logger.log(
+      `Media uploaded: ${media.id} for incident ${dto.incidentId}`,
+    );
 
-      // Check if this is the first media (make it primary)
-      const existingMedia = await prisma.incidentMedia.count({
-        where: { incidentId },
-      });
+    // TODO: Queue for moderation/AI content analysis
 
-      // Create media record
-      const media = await prisma.incidentMedia.create({
-        data: {
-          incidentId,
-          userId,
-          mediaType,
-          url: result.url,
-          fileSize: result.size,
-          isPrimary: existingMedia === 0,
-          moderationStatus: config.features.requireModeration ? 'PENDING' : 'APPROVED',
-        },
-      });
-
-      // Add to moderation queue if required
-      if (config.features.requireModeration) {
-        await prisma.moderationQueue.create({
-          data: {
-            contentType: 'MEDIA',
-            contentId: media.id,
-            reason: 'NEW_CONTENT',
-            priority: 1,
-          },
-        });
-      }
-
-      return media;
-    } else if (this.storageService.isAllowedVideoType(contentType)) {
-      mediaType = 'VIDEO';
-
-      // Check file size
-      const buffer = await file.toBuffer();
-      if (buffer.length > config.media.maxVideoSizeMb * 1024 * 1024) {
-        throw new BadRequestError(
-          `Video size exceeds maximum of ${config.media.maxVideoSizeMb}MB`
-        );
-      }
-
-      // Upload file
-      const result = await this.storageService.uploadFile(
-        buffer,
-        file.filename,
-        contentType,
-        `incidents/${incidentId}`
-      );
-
-      // Check if this is the first media (make it primary)
-      const existingMedia = await prisma.incidentMedia.count({
-        where: { incidentId },
-      });
-
-      // Create media record
-      const media = await prisma.incidentMedia.create({
-        data: {
-          incidentId,
-          userId,
-          mediaType,
-          url: result.url,
-          fileSize: result.size,
-          isPrimary: existingMedia === 0,
-          moderationStatus: config.features.requireModeration ? 'PENDING' : 'APPROVED',
-        },
-      });
-
-      // Add to moderation queue if required
-      if (config.features.requireModeration) {
-        await prisma.moderationQueue.create({
-          data: {
-            contentType: 'MEDIA',
-            contentId: media.id,
-            reason: 'NEW_CONTENT',
-            priority: 1,
-          },
-        });
-      }
-
-      return media;
-    } else {
-      throw new BadRequestError('Unsupported file type');
-    }
+    return media;
   }
 
   /**
    * Get media for an incident
    */
-  async getIncidentMedia(incidentId: string) {
-    return prisma.incidentMedia.findMany({
+  async getMediaForIncident(incidentId: string) {
+    return this.prisma.incidentMedia.findMany({
       where: {
         incidentId,
-        moderationStatus: 'APPROVED',
+        moderationStatus: ModerationStatus.APPROVED,
       },
       orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
     });
@@ -157,60 +155,96 @@ export class MediaService {
   /**
    * Delete media
    */
-  async deleteMedia(mediaId: string, userId: string, isAdmin = false) {
-    const media = await prisma.incidentMedia.findUnique({
+  async deleteMedia(mediaId: string, user: User) {
+    const media = await this.prisma.incidentMedia.findUnique({
       where: { id: mediaId },
       include: { incident: true },
     });
 
     if (!media) {
-      throw new NotFoundError('Media not found');
+      throw new NotFoundException('Media not found');
     }
 
-    if (media.userId !== userId && !isAdmin) {
-      throw new ForbiddenError('You can only delete your own media');
+    // Only owner or admin can delete
+    if (media.userId !== user.id && user.role !== 'ADMIN') {
+      throw new ForbiddenException('Not authorized to delete this media');
     }
 
-    // Extract key from URL
-    const key = media.url.replace(`${config.s3.publicUrl}/`, '');
+    // Delete from S3
+    if (media.s3Key) {
+      await this.storageService.deleteFile(media.s3Key);
+    }
 
-    // Delete from storage
-    await this.storageService.deleteFile(key);
+    // Delete thumbnail if exists
+    if (media.thumbnailUrl) {
+      const thumbnailKey = media.thumbnailUrl.split('/').pop();
+      if (thumbnailKey) {
+        try {
+          await this.storageService.deleteFile(`thumbnails/${thumbnailKey}`);
+        } catch {
+          // Ignore thumbnail deletion errors
+        }
+      }
+    }
 
-    // Delete from database
-    await prisma.incidentMedia.delete({
-      where: { id: mediaId },
-    });
+    await this.prisma.incidentMedia.delete({ where: { id: mediaId } });
+
+    this.logger.log(`Media deleted: ${mediaId}`);
   }
 
   /**
-   * Set primary media for an incident
+   * Set media as primary for incident
    */
-  async setPrimaryMedia(incidentId: string, mediaId: string, userId: string) {
-    const incident = await prisma.incident.findUnique({
-      where: { id: incidentId },
-    });
-
-    if (!incident) {
-      throw new NotFoundError('Incident not found');
-    }
-
-    if (incident.userId !== userId) {
-      throw new ForbiddenError('You can only modify your own incidents');
-    }
-
-    // Remove primary from all media
-    await prisma.incidentMedia.updateMany({
-      where: { incidentId },
-      data: { isPrimary: false },
-    });
-
-    // Set new primary
-    const media = await prisma.incidentMedia.update({
+  async setPrimaryMedia(mediaId: string, user: User) {
+    const media = await this.prisma.incidentMedia.findUnique({
       where: { id: mediaId },
-      data: { isPrimary: true },
+      include: { incident: true },
     });
 
-    return media;
+    if (!media) {
+      throw new NotFoundException('Media not found');
+    }
+
+    if (media.userId !== user.id && user.role !== 'ADMIN') {
+      throw new ForbiddenException('Not authorized');
+    }
+
+    // Update all media for this incident
+    await this.prisma.$transaction([
+      // Remove primary from all
+      this.prisma.incidentMedia.updateMany({
+        where: { incidentId: media.incidentId },
+        data: { isPrimary: false },
+      }),
+      // Set this one as primary
+      this.prisma.incidentMedia.update({
+        where: { id: mediaId },
+        data: { isPrimary: true },
+      }),
+    ]);
+
+    return { message: 'Primary media updated' };
+  }
+
+  /**
+   * Moderate media (admin only)
+   */
+  async moderateMedia(
+    mediaId: string,
+    status: ModerationStatus,
+    notes?: string,
+  ) {
+    const media = await this.prisma.incidentMedia.findUnique({
+      where: { id: mediaId },
+    });
+
+    if (!media) {
+      throw new NotFoundException('Media not found');
+    }
+
+    return this.prisma.incidentMedia.update({
+      where: { id: mediaId },
+      data: { moderationStatus: status },
+    });
   }
 }

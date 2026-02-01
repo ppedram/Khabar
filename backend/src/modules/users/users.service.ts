@@ -1,20 +1,61 @@
-import { prisma } from '../../config/database.js';
-import { NotFoundError, ConflictError } from '../../utils/errors.js';
-import type {
-  UpdateProfileInput,
-  UpdateSettingsInput,
-  RegisterDeviceInput,
-  ReportUserInput,
-} from './users.schema.js';
-import type { PaginationParams } from '../../utils/pagination.js';
-import { getSkip, paginate } from '../../utils/pagination.js';
+import {
+  Injectable,
+  NotFoundException,
+  ConflictException,
+  BadRequestException,
+} from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { ReputationService } from '../reputation/reputation.service';
+import { UpdateProfileDto, UpdateSettingsDto } from './dto/users.dto';
+import { User } from '@prisma/client';
 
-export class UserService {
+@Injectable()
+export class UsersService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly reputationService: ReputationService,
+  ) {}
+
   /**
-   * Get current user profile
+   * Get user profile by ID
    */
-  async getCurrentUser(userId: string) {
-    const user = await prisma.user.findUnique({
+  async findById(id: string, includePrivate = false) {
+    const user = await this.prisma.user.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        displayName: true,
+        username: true,
+        avatarUrl: true,
+        role: true,
+        reputationScore: true,
+        reportsCount: true,
+        verifiedReportsCount: true,
+        isVerifiedUser: true,
+        createdAt: true,
+        // Private fields
+        ...(includePrivate && {
+          email: true,
+          appleEmail: true,
+          phoneNumber: true,
+          authProvider: true,
+          lastActiveAt: true,
+        }),
+      },
+    });
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    return user;
+  }
+
+  /**
+   * Get current user's full profile
+   */
+  async getMyProfile(userId: string) {
+    const user = await this.prisma.user.findUnique({
       where: { id: userId },
       include: {
         settings: true,
@@ -28,80 +69,89 @@ export class UserService {
     });
 
     if (!user) {
-      throw new NotFoundError('User not found');
+      throw new NotFoundException('User not found');
     }
 
-    return this.sanitizeUser(user);
+    // Get reputation stats
+    const reputationStats = await this.reputationService.getReputationStats(userId);
+
+    // Remove sensitive fields
+    const { appleRefreshToken, ...safeUser } = user;
+
+    return {
+      ...safeUser,
+      reputationStats,
+    };
   }
 
   /**
    * Update user profile
    */
-  async updateProfile(userId: string, data: UpdateProfileInput) {
-    // Check username uniqueness if provided
-    if (data.username) {
-      const existingUser = await prisma.user.findFirst({
-        where: {
-          username: data.username,
-          id: { not: userId },
-        },
+  async updateProfile(userId: string, dto: UpdateProfileDto) {
+    // Check username uniqueness if being changed
+    if (dto.username) {
+      const existing = await this.prisma.user.findUnique({
+        where: { username: dto.username },
       });
-
-      if (existingUser) {
-        throw new ConflictError('Username already taken');
+      if (existing && existing.id !== userId) {
+        throw new ConflictException('Username is already taken');
       }
     }
 
-    // Check email uniqueness if provided
-    if (data.email) {
-      const existingUser = await prisma.user.findFirst({
-        where: {
-          email: data.email,
-          id: { not: userId },
-        },
-      });
-
-      if (existingUser) {
-        throw new ConflictError('Email already in use');
-      }
-    }
-
-    const user = await prisma.user.update({
+    const updated = await this.prisma.user.update({
       where: { id: userId },
       data: {
-        username: data.username,
-        displayName: data.displayName,
-        email: data.email,
+        displayName: dto.displayName,
+        username: dto.username,
+        avatarUrl: dto.avatarUrl,
       },
-      include: { settings: true },
+      select: {
+        id: true,
+        displayName: true,
+        username: true,
+        avatarUrl: true,
+        email: true,
+        role: true,
+        reputationScore: true,
+        isVerifiedUser: true,
+      },
     });
 
-    return this.sanitizeUser(user);
+    return updated;
   }
 
   /**
-   * Update user avatar
+   * Update user settings
    */
-  async updateAvatar(userId: string, avatarUrl: string) {
-    const user = await prisma.user.update({
-      where: { id: userId },
-      data: { avatarUrl },
+  async updateSettings(userId: string, dto: UpdateSettingsDto) {
+    // Validate notification radius
+    if (dto.notificationRadiusKm && dto.notificationRadiusKm > 50) {
+      throw new BadRequestException('Notification radius cannot exceed 50km');
+    }
+
+    const settings = await this.prisma.userSettings.upsert({
+      where: { userId },
+      create: {
+        userId,
+        ...dto,
+      },
+      update: dto,
     });
 
-    return { avatarUrl: user.avatarUrl };
+    return settings;
   }
 
   /**
    * Get user settings
    */
   async getSettings(userId: string) {
-    const settings = await prisma.userSettings.findUnique({
+    let settings = await this.prisma.userSettings.findUnique({
       where: { userId },
     });
 
+    // Create default settings if not exists
     if (!settings) {
-      // Create default settings if not exists
-      return prisma.userSettings.create({
+      settings = await this.prisma.userSettings.create({
         data: {
           userId,
           notificationRadiusKm: 5.0,
@@ -114,216 +164,104 @@ export class UserService {
   }
 
   /**
-   * Update user settings
-   */
-  async updateSettings(userId: string, data: UpdateSettingsInput) {
-    const settings = await prisma.userSettings.upsert({
-      where: { userId },
-      update: {
-        notificationRadiusKm: data.notificationRadiusKm,
-        notificationsEnabled: data.notificationsEnabled,
-        notifyCategories: data.notifyCategories,
-        quietHoursStart: data.quietHoursStart,
-        quietHoursEnd: data.quietHoursEnd,
-        homeLocationLat: data.homeLocationLat,
-        homeLocationLng: data.homeLocationLng,
-      },
-      create: {
-        userId,
-        notificationRadiusKm: data.notificationRadiusKm ?? 5.0,
-        notificationsEnabled: data.notificationsEnabled ?? true,
-        notifyCategories: data.notifyCategories ?? [],
-        quietHoursStart: data.quietHoursStart,
-        quietHoursEnd: data.quietHoursEnd,
-        homeLocationLat: data.homeLocationLat,
-        homeLocationLng: data.homeLocationLng,
-      },
-    });
-
-    return settings;
-  }
-
-  /**
-   * Get user's incidents
-   */
-  async getUserIncidents(userId: string, pagination: PaginationParams) {
-    const [incidents, total] = await Promise.all([
-      prisma.incident.findMany({
-        where: { userId },
-        include: {
-          category: true,
-          _count: {
-            select: {
-              comments: true,
-              media: true,
-            },
-          },
-        },
-        orderBy: { createdAt: 'desc' },
-        skip: getSkip(pagination.page, pagination.limit),
-        take: pagination.limit,
-      }),
-      prisma.incident.count({ where: { userId } }),
-    ]);
-
-    return paginate(incidents, total, pagination);
-  }
-
-  /**
-   * Register device for push notifications
-   */
-  async registerDevice(userId: string, data: RegisterDeviceInput) {
-    const device = await prisma.userDevice.upsert({
-      where: {
-        userId_deviceToken: {
-          userId,
-          deviceToken: data.deviceToken,
-        },
-      },
-      update: {
-        deviceType: data.deviceType,
-        deviceName: data.deviceName,
-        isActive: true,
-        lastUsedAt: new Date(),
-      },
-      create: {
-        userId,
-        deviceToken: data.deviceToken,
-        deviceType: data.deviceType,
-        deviceName: data.deviceName,
-        isActive: true,
-      },
-    });
-
-    return device;
-  }
-
-  /**
-   * Unregister device
-   */
-  async unregisterDevice(userId: string, deviceId: string) {
-    await prisma.userDevice.updateMany({
-      where: {
-        id: deviceId,
-        userId,
-      },
-      data: { isActive: false },
-    });
-  }
-
-  /**
    * Get public user profile
    */
   async getPublicProfile(userId: string) {
-    const user = await prisma.user.findUnique({
+    const user = await this.prisma.user.findUnique({
       where: { id: userId },
       select: {
         id: true,
-        username: true,
         displayName: true,
+        username: true,
         avatarUrl: true,
         reputationScore: true,
         reportsCount: true,
         verifiedReportsCount: true,
+        isVerifiedUser: true,
         createdAt: true,
-        _count: {
-          select: {
-            incidents: {
-              where: { status: { in: ['VERIFIED', 'RESOLVED'] } },
-            },
-          },
-        },
       },
     });
 
     if (!user) {
-      throw new NotFoundError('User not found');
+      throw new NotFoundException('User not found');
     }
 
     return user;
   }
 
   /**
-   * Report a user
+   * Get user's incident history
    */
-  async reportUser(
-    reporterId: string,
-    reportedUserId: string,
-    data: ReportUserInput
-  ) {
-    if (reporterId === reportedUserId) {
-      throw new ConflictError('You cannot report yourself');
-    }
+  async getUserIncidents(userId: string, limit = 20, offset = 0) {
+    const [incidents, total] = await Promise.all([
+      this.prisma.incident.findMany({
+        where: { userId, isAnonymous: false },
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        skip: offset,
+        include: {
+          category: {
+            select: { name: true, icon: true, color: true },
+          },
+        },
+      }),
+      this.prisma.incident.count({ where: { userId, isAnonymous: false } }),
+    ]);
 
-    // Check if user exists
-    const reportedUser = await prisma.user.findUnique({
-      where: { id: reportedUserId },
-    });
-
-    if (!reportedUser) {
-      throw new NotFoundError('User not found');
-    }
-
-    // Create report
-    const report = await prisma.userReport.create({
-      data: {
-        reporterId,
-        reportedUserId,
-        reason: data.reason,
-        description: data.description,
-      },
-    });
-
-    // Add to moderation queue
-    await prisma.moderationQueue.create({
-      data: {
-        contentType: 'USER',
-        contentId: reportedUserId,
-        reason: 'REPORTED',
-        reportedById: reporterId,
-        reportReason: data.description,
-        priority: 2,
-      },
-    });
-
-    return report;
+    return { incidents, total };
   }
 
   /**
-   * Sanitize user for response
+   * Get reputation history
    */
-  private sanitizeUser(user: {
-    id: string;
-    phoneNumber: string;
-    email: string | null;
-    username: string | null;
-    displayName: string | null;
-    avatarUrl: string | null;
-    role: string;
-    reputationScore: number;
-    reportsCount: number;
-    verifiedReportsCount: number;
-    createdAt: Date;
-    settings?: object | null;
-    _count?: {
-      incidents?: number;
-      comments?: number;
-    };
-  }) {
-    return {
-      id: user.id,
-      phoneNumber: user.phoneNumber,
-      email: user.email,
-      username: user.username,
-      displayName: user.displayName,
-      avatarUrl: user.avatarUrl,
-      role: user.role,
-      reputationScore: user.reputationScore,
-      reportsCount: user.reportsCount,
-      verifiedReportsCount: user.verifiedReportsCount,
-      createdAt: user.createdAt,
-      settings: user.settings,
-      stats: user._count,
-    };
+  async getReputationHistory(userId: string, limit = 20, offset = 0) {
+    return this.reputationService.getReputationHistory(userId, limit, offset);
+  }
+
+  /**
+   * Get reputation leaderboard
+   */
+  async getLeaderboard(limit = 10) {
+    return this.reputationService.getLeaderboard(limit);
+  }
+
+  /**
+   * Check username availability
+   */
+  async checkUsernameAvailability(username: string): Promise<boolean> {
+    const user = await this.prisma.user.findUnique({
+      where: { username },
+    });
+    return !user;
+  }
+
+  /**
+   * Deactivate account
+   */
+  async deactivateAccount(userId: string): Promise<void> {
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        isBanned: true,
+        banReason: 'User requested account deactivation',
+        bannedAt: new Date(),
+      },
+    });
+
+    // Revoke all tokens
+    await this.prisma.refreshToken.updateMany({
+      where: { userId },
+      data: { revokedAt: new Date() },
+    });
+  }
+
+  /**
+   * Delete account and all associated data
+   */
+  async deleteAccount(userId: string): Promise<void> {
+    // This will cascade delete due to Prisma relations
+    await this.prisma.user.delete({
+      where: { id: userId },
+    });
   }
 }

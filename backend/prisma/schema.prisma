@@ -19,6 +19,12 @@ enum UserRole {
   ADMIN
 }
 
+enum AuthProvider {
+  APPLE
+  PHONE
+  EMAIL
+}
+
 enum DeviceType {
   IOS
   ANDROID
@@ -108,28 +114,63 @@ enum UpdateType {
   RESOLUTION
 }
 
+enum ReputationAction {
+  INCIDENT_CREATED
+  INCIDENT_VERIFIED
+  INCIDENT_REJECTED
+  UPVOTE_RECEIVED
+  DOWNVOTE_RECEIVED
+  VERIFY_RECEIVED
+  COMMENT_UPVOTED
+  REPORT_ACCEPTED
+  REPORT_REJECTED
+  BAN_PENALTY
+  ADMIN_ADJUSTMENT
+}
+
 // ============================================================================
 // MODELS
 // ============================================================================
 
 model User {
-  id                   String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  phoneNumber          String    @unique @map("phone_number") @db.VarChar(20)
-  phoneVerified        Boolean   @default(false) @map("phone_verified")
-  email                String?   @unique @db.VarChar(255)
-  username             String?   @unique @db.VarChar(50)
-  displayName          String?   @map("display_name") @db.VarChar(100)
-  avatarUrl            String?   @map("avatar_url")
-  passwordHash         String?   @map("password_hash") @db.VarChar(255)
-  role                 UserRole  @default(USER)
-  reputationScore      Int       @default(0) @map("reputation_score")
-  reportsCount         Int       @default(0) @map("reports_count")
-  verifiedReportsCount Int       @default(0) @map("verified_reports_count")
-  isBanned             Boolean   @default(false) @map("is_banned")
-  banReason            String?   @map("ban_reason")
-  lastActiveAt         DateTime? @map("last_active_at")
-  createdAt            DateTime  @default(now()) @map("created_at")
-  updatedAt            DateTime  @updatedAt @map("updated_at")
+  id                   String       @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+
+  // Apple Sign-in fields
+  appleId              String?      @unique @map("apple_id") @db.VarChar(255)
+  appleEmail           String?      @map("apple_email") @db.VarChar(255)
+  appleRefreshToken    String?      @map("apple_refresh_token")
+
+  // Standard auth fields
+  phoneNumber          String?      @unique @map("phone_number") @db.VarChar(20)
+  phoneVerified        Boolean      @default(false) @map("phone_verified")
+  email                String?      @unique @db.VarChar(255)
+  emailVerified        Boolean      @default(false) @map("email_verified")
+  authProvider         AuthProvider @default(APPLE) @map("auth_provider")
+
+  // Profile fields
+  username             String?      @unique @db.VarChar(50)
+  displayName          String?      @map("display_name") @db.VarChar(100)
+  avatarUrl            String?      @map("avatar_url")
+
+  // Role and permissions
+  role                 UserRole     @default(USER)
+
+  // Reputation system
+  reputationScore      Int          @default(0) @map("reputation_score")
+  reportsCount         Int          @default(0) @map("reports_count")
+  verifiedReportsCount Int          @default(0) @map("verified_reports_count")
+  isVerifiedUser       Boolean      @default(false) @map("is_verified_user")
+
+  // Account status
+  isBanned             Boolean      @default(false) @map("is_banned")
+  banReason            String?      @map("ban_reason")
+  bannedAt             DateTime?    @map("banned_at")
+  bannedUntil          DateTime?    @map("banned_until")
+
+  // Timestamps
+  lastActiveAt         DateTime?    @map("last_active_at")
+  createdAt            DateTime     @default(now()) @map("created_at")
+  updatedAt            DateTime     @updatedAt @map("updated_at")
 
   // Relations
   devices            UserDevice[]
@@ -147,24 +188,35 @@ model User {
   reportsFiled       UserReport[]      @relation("Reporter")
   reportsReceived    UserReport[]      @relation("ReportedUser")
   auditLogs          AuditLog[]
+  reputationLogs     ReputationLog[]
 
+  @@index([appleId])
   @@index([phoneNumber])
   @@index([email])
   @@index([username])
   @@index([role])
+  @@index([reputationScore])
   @@index([createdAt])
   @@map("users")
 }
 
 model UserDevice {
-  id          String     @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  userId      String     @map("user_id") @db.Uuid
-  deviceToken String     @map("device_token")
-  deviceType  DeviceType @map("device_type")
-  deviceName  String?    @map("device_name") @db.VarChar(100)
-  isActive    Boolean    @default(true) @map("is_active")
-  lastUsedAt  DateTime?  @map("last_used_at")
-  createdAt   DateTime   @default(now()) @map("created_at")
+  id               String     @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId           String     @map("user_id") @db.Uuid
+  deviceToken      String     @map("device_token")
+  deviceType       DeviceType @map("device_type")
+  deviceName       String?    @map("device_name") @db.VarChar(100)
+  deviceModel      String?    @map("device_model") @db.VarChar(100)
+  osVersion        String?    @map("os_version") @db.VarChar(50)
+  appVersion       String?    @map("app_version") @db.VarChar(50)
+
+  // APNs specific fields
+  apnsToken        String?    @map("apns_token")
+  apnsEnvironment  String?    @map("apns_environment") @db.VarChar(20) // 'production' or 'sandbox'
+
+  isActive         Boolean    @default(true) @map("is_active")
+  lastUsedAt       DateTime?  @map("last_used_at")
+  createdAt        DateTime   @default(now()) @map("created_at")
 
   // Relations
   user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -173,6 +225,7 @@ model UserDevice {
   @@unique([userId, deviceToken])
   @@index([userId])
   @@index([deviceToken])
+  @@index([apnsToken])
   @@map("user_devices")
 }
 
@@ -182,10 +235,11 @@ model UserSettings {
   notificationRadiusKm  Decimal  @default(5.0) @map("notification_radius_km") @db.Decimal(5, 2)
   notificationsEnabled  Boolean  @default(true) @map("notifications_enabled")
   notifyCategories      Json     @default("[]") @map("notify_categories")
-  quietHoursStart       String?  @map("quiet_hours_start") @db.VarChar(5)
+  quietHoursStart       String?  @map("quiet_hours_start") @db.VarChar(5) // HH:MM format
   quietHoursEnd         String?  @map("quiet_hours_end") @db.VarChar(5)
   homeLocationLat       Decimal? @map("home_location_lat") @db.Decimal(10, 8)
   homeLocationLng       Decimal? @map("home_location_lng") @db.Decimal(11, 8)
+  timezone              String?  @default("UTC") @db.VarChar(50)
   createdAt             DateTime @default(now()) @map("created_at")
   updatedAt             DateTime @updatedAt @map("updated_at")
 
@@ -204,6 +258,7 @@ model Category {
   color         String?  @db.VarChar(7)
   severityLevel Int      @default(1) @map("severity_level")
   isActive      Boolean  @default(true) @map("is_active")
+  sortOrder     Int      @default(0) @map("sort_order")
   createdAt     DateTime @default(now()) @map("created_at")
 
   // Relations
@@ -211,6 +266,7 @@ model Category {
 
   @@index([slug])
   @@index([isActive])
+  @@index([sortOrder])
   @@map("categories")
 }
 
@@ -220,32 +276,58 @@ model Incident {
   categoryId     String           @map("category_id") @db.Uuid
   title          String           @db.VarChar(200)
   description    String?
+
+  // Geospatial fields (Google Maps format: lat/lng)
   latitude       Decimal          @db.Decimal(10, 8)
   longitude      Decimal          @db.Decimal(11, 8)
+  // Note: We'll create a PostGIS geography column via raw SQL migration
+  // for efficient spatial queries with GIST index
+
+  // Location metadata
   address        String?
   city           String?          @db.VarChar(100)
   neighborhood   String?          @db.VarChar(100)
+  postalCode     String?          @map("postal_code") @db.VarChar(20)
+  country        String?          @default("US") @db.VarChar(2)
+
+  // Status and severity
   status         IncidentStatus   @default(PENDING)
   severity       IncidentSeverity @default(MEDIUM)
+
+  // Privacy
   isAnonymous    Boolean          @default(false) @map("is_anonymous")
+
+  // Engagement metrics
   viewsCount     Int              @default(0) @map("views_count")
   upvotesCount   Int              @default(0) @map("upvotes_count")
+  downvotesCount Int              @default(0) @map("downvotes_count")
+  verifyCount    Int              @default(0) @map("verify_count")
   commentsCount  Int              @default(0) @map("comments_count")
-  expiresAt      DateTime?        @map("expires_at")
+
+  // Verification
+  verificationThreshold Int       @default(3) @map("verification_threshold")
   verifiedAt     DateTime?        @map("verified_at")
   verifiedById   String?          @map("verified_by") @db.Uuid
+
+  // Resolution
   resolvedAt     DateTime?        @map("resolved_at")
+  resolutionNote String?          @map("resolution_note")
+
+  // Expiration
+  expiresAt      DateTime?        @map("expires_at")
+
+  // Timestamps
   createdAt      DateTime         @default(now()) @map("created_at")
   updatedAt      DateTime         @updatedAt @map("updated_at")
 
   // Relations
-  user       User             @relation("UserIncidents", fields: [userId], references: [id])
-  category   Category         @relation(fields: [categoryId], references: [id])
-  verifiedBy User?            @relation("VerifiedByUser", fields: [verifiedById], references: [id])
-  media      IncidentMedia[]
-  updates    IncidentUpdate[]
-  comments   Comment[]
-  votes      Vote[]
+  user          User             @relation("UserIncidents", fields: [userId], references: [id])
+  category      Category         @relation(fields: [categoryId], references: [id])
+  verifiedBy    User?            @relation("VerifiedByUser", fields: [verifiedById], references: [id])
+  media         IncidentMedia[]
+  updates       IncidentUpdate[]
+  comments      Comment[]
+  votes         Vote[]
   notifications Notification[]
 
   @@index([userId])
@@ -255,6 +337,7 @@ model Incident {
   @@index([createdAt])
   @@index([latitude, longitude])
   @@index([status, createdAt])
+  @@index([expiresAt])
   @@map("incidents")
 }
 
@@ -263,10 +346,27 @@ model IncidentMedia {
   incidentId       String           @map("incident_id") @db.Uuid
   userId           String           @map("user_id") @db.Uuid
   mediaType        MediaType        @map("media_type")
+
+  // S3/Storage URLs
   url              String
   thumbnailUrl     String?          @map("thumbnail_url")
+  s3Key            String?          @map("s3_key")
+  s3Bucket         String?          @map("s3_bucket")
+
+  // File metadata
+  fileName         String?          @map("file_name") @db.VarChar(255)
+  mimeType         String?          @map("mime_type") @db.VarChar(100)
   fileSize         Int?             @map("file_size")
+
+  // Video specific
   durationSeconds  Int?             @map("duration_seconds")
+  width            Int?
+  height           Int?
+
+  // iOS specific metadata
+  deviceModel      String?          @map("device_model") @db.VarChar(100)
+  capturedAt       DateTime?        @map("captured_at")
+
   isPrimary        Boolean          @default(false) @map("is_primary")
   moderationStatus ModerationStatus @default(PENDING) @map("moderation_status")
   createdAt        DateTime         @default(now()) @map("created_at")
@@ -287,6 +387,7 @@ model IncidentUpdate {
   userId     String     @map("user_id") @db.Uuid
   updateType UpdateType @map("update_type")
   content    String
+  metadata   Json?
   createdAt  DateTime   @default(now()) @map("created_at")
 
   // Relations
@@ -345,6 +446,31 @@ model Vote {
   @@map("votes")
 }
 
+model ReputationLog {
+  id              String           @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId          String           @map("user_id") @db.Uuid
+  action          ReputationAction
+  points          Int
+  previousScore   Int              @map("previous_score")
+  newScore        Int              @map("new_score")
+
+  // Reference to related entity
+  referenceType   String?          @map("reference_type") @db.VarChar(50)
+  referenceId     String?          @map("reference_id") @db.Uuid
+
+  description     String?
+  metadata        Json?
+  createdAt       DateTime         @default(now()) @map("created_at")
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("reputation_logs")
+}
+
 model Notification {
   id         String           @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
   userId     String           @map("user_id") @db.Uuid
@@ -353,8 +479,18 @@ model Notification {
   title      String           @db.VarChar(200)
   body       String?
   data       Json?
+
+  // APNs specific
+  apnsId     String?          @map("apns_id") @db.VarChar(100)
+  apnsCategory String?        @map("apns_category") @db.VarChar(50) // e.g., "NEARBY_INCIDENT"
+
+  // Delivery status
   isRead     Boolean          @default(false) @map("is_read")
+  isSent     Boolean          @default(false) @map("is_sent")
   sentAt     DateTime?        @map("sent_at")
+  readAt     DateTime?        @map("read_at")
+  failReason String?          @map("fail_reason")
+
   createdAt  DateTime         @default(now()) @map("created_at")
 
   // Relations
@@ -364,6 +500,7 @@ model Notification {
   @@index([userId])
   @@index([userId, isRead])
   @@index([createdAt])
+  @@index([type])
   @@map("notifications")
 }
 

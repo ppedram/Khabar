@@ -1,6 +1,7 @@
 version: '3.8'
 
 services:
+  # PostgreSQL with PostGIS for geospatial queries
   postgres:
     image: postgis/postgis:16-3.4
     container_name: khabar-postgres
@@ -18,7 +19,10 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - khabar-network
 
+  # Redis for caching, sessions, and real-time pub/sub
   redis:
     image: redis:7-alpine
     container_name: khabar-redis
@@ -26,13 +30,16 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - khabar-network
 
+  # MinIO for S3-compatible object storage (videos/images)
   minio:
     image: minio/minio:latest
     container_name: khabar-minio
@@ -50,6 +57,8 @@ services:
       interval: 30s
       timeout: 20s
       retries: 3
+    networks:
+      - khabar-network
 
   # MinIO bucket creation helper
   minio-init:
@@ -62,15 +71,69 @@ services:
       /bin/sh -c "
       mc alias set myminio http://minio:9000 minioadmin minioadmin;
       mc mb myminio/khabar-media --ignore-existing;
+      mc mb myminio/khabar-thumbnails --ignore-existing;
       mc anonymous set download myminio/khabar-media;
+      mc anonymous set download myminio/khabar-thumbnails;
       exit 0;
       "
+    networks:
+      - khabar-network
+
+  # BullMQ Dashboard (optional - for job monitoring)
+  bullboard:
+    image: deadly0/bull-board
+    container_name: khabar-bullboard
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      BULL_PREFIX: bull
+    ports:
+      - "3030:3000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - khabar-network
+
+  # Application (for production-like testing)
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: khabar-app
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      DATABASE_URL: postgresql://khabar:khabar_secret@postgres:5432/khabar?schema=public
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_BUCKET_NAME: khabar-media
+      S3_REGION: us-east-1
+      S3_PUBLIC_URL: http://localhost:9000/khabar-media
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - khabar-network
+    profiles:
+      - full
 
 volumes:
   postgres_data:
+    driver: local
   redis_data:
+    driver: local
   minio_data:
+    driver: local
 
 networks:
-  default:
-    name: khabar-network
+  khabar-network:
+    driver: bridge

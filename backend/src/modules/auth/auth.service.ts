@@ -1,353 +1,349 @@
-import type { FastifyInstance } from 'fastify';
-import Twilio from 'twilio';
-import { prisma } from '../../config/database.js';
-import { cache } from '../../config/redis.js';
-import { config } from '../../config/index.js';
-import { logger } from '../../utils/logger.js';
-import { generateToken, hashToken, generateOTP } from '../../utils/crypto.js';
 import {
-  UnauthorizedError,
-  BadRequestError,
-  TooManyRequestsError,
-} from '../../utils/errors.js';
-import type { RequestOtpInput, VerifyOtpInput } from './auth.schema.js';
-import type { JWTPayload } from '../../types/fastify.js';
+  Injectable,
+  UnauthorizedException,
+  ConflictException,
+  Logger,
+} from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import { ConfigService } from '@nestjs/config';
+import * as bcrypt from 'bcrypt';
+import { PrismaService } from '../prisma/prisma.service';
+import { AppleAuthService } from './apple-auth.service';
+import {
+  AppleSignInDto,
+  RefreshTokenDto,
+  RegisterDeviceDto,
+} from './dto/auth.dto';
+import { User, AuthProvider } from '@prisma/client';
 
-// Initialize Twilio client
-const twilioClient = config.twilio.accountSid
-  ? Twilio(config.twilio.accountSid, config.twilio.authToken)
-  : null;
+interface TokenPair {
+  accessToken: string;
+  refreshToken: string;
+  expiresIn: number;
+}
 
+interface AuthResponse extends TokenPair {
+  user: Partial<User>;
+  isNewUser: boolean;
+}
+
+@Injectable()
 export class AuthService {
-  constructor(private readonly fastify: FastifyInstance) {}
+  private readonly logger = new Logger(AuthService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly jwtService: JwtService,
+    private readonly configService: ConfigService,
+    private readonly appleAuthService: AppleAuthService,
+  ) {}
 
   /**
-   * Request OTP for phone verification
+   * Sign in with Apple
    */
-  async requestOtp(data: RequestOtpInput): Promise<{ message: string }> {
-    const { phoneNumber } = data;
-
-    // Check rate limit (additional to global)
-    const rateLimitKey = `otp_rate:${phoneNumber}`;
-    const attempts = await cache.get<number>(rateLimitKey);
-    if (attempts && attempts >= 3) {
-      throw new TooManyRequestsError(
-        'Too many OTP requests. Please wait 10 minutes before trying again.'
-      );
-    }
-
-    // Use Twilio Verify if configured
-    if (twilioClient && config.twilio.verifyServiceSid) {
-      try {
-        await twilioClient.verify.v2
-          .services(config.twilio.verifyServiceSid)
-          .verifications.create({
-            to: phoneNumber,
-            channel: 'sms',
-          });
-
-        logger.info({ phoneNumber: phoneNumber.slice(-4) }, 'OTP sent via Twilio');
-      } catch (error) {
-        logger.error({ error }, 'Twilio verification failed');
-        throw new BadRequestError('Failed to send verification code');
-      }
-    } else {
-      // Development fallback: generate and store OTP in Redis
-      const otp = generateOTP();
-      await cache.set(`otp:${phoneNumber}`, otp, 300); // 5 minutes expiry
-      logger.info({ phoneNumber: phoneNumber.slice(-4), otp }, 'DEV OTP generated');
-    }
-
-    // Update rate limit
-    const newAttempts = (attempts ?? 0) + 1;
-    await cache.set(rateLimitKey, newAttempts, 600); // 10 minutes
-
-    return { message: 'Verification code sent' };
-  }
-
-  /**
-   * Verify OTP and issue tokens
-   */
-  async verifyOtp(
-    data: VerifyOtpInput
-  ): Promise<{ accessToken: string; refreshToken: string; user: object }> {
-    const { phoneNumber, code, deviceToken, deviceType, deviceName } = data;
-
-    // Verify OTP
-    let isValid = false;
-
-    if (twilioClient && config.twilio.verifyServiceSid) {
-      try {
-        const verification = await twilioClient.verify.v2
-          .services(config.twilio.verifyServiceSid)
-          .verificationChecks.create({
-            to: phoneNumber,
-            code,
-          });
-
-        isValid = verification.status === 'approved';
-      } catch (error) {
-        logger.error({ error }, 'Twilio verification check failed');
-        throw new UnauthorizedError('Invalid verification code');
-      }
-    } else {
-      // Development fallback: check Redis
-      const storedOtp = await cache.get<string>(`otp:${phoneNumber}`);
-      isValid = storedOtp === code;
-      if (isValid) {
-        await cache.del(`otp:${phoneNumber}`);
-      }
-    }
-
-    if (!isValid) {
-      throw new UnauthorizedError('Invalid verification code');
-    }
+  async signInWithApple(dto: AppleSignInDto): Promise<AuthResponse> {
+    // Verify the Apple identity token
+    const appleUser = await this.appleAuthService.verifyIdentityToken(
+      dto.identityToken,
+    );
 
     // Find or create user
-    let user = await prisma.user.findUnique({
-      where: { phoneNumber },
-      include: { settings: true },
+    let user = await this.prisma.user.findUnique({
+      where: { appleId: appleUser.appleId },
     });
+
+    const isNewUser = !user;
 
     if (!user) {
       // Create new user
-      user = await prisma.user.create({
+      user = await this.prisma.user.create({
         data: {
-          phoneNumber,
-          phoneVerified: true,
+          appleId: appleUser.appleId,
+          appleEmail: appleUser.email,
+          email: appleUser.isPrivateEmail ? undefined : appleUser.email,
+          emailVerified: appleUser.emailVerified,
+          authProvider: AuthProvider.APPLE,
+          displayName: dto.fullName || undefined,
           settings: {
             create: {
-              notificationRadiusKm: config.geo.defaultSearchRadiusKm,
+              notificationRadiusKm: 5.0,
               notificationsEnabled: true,
             },
           },
         },
-        include: { settings: true },
       });
-      logger.info({ userId: user.id }, 'New user created');
-    } else if (!user.phoneVerified) {
-      // Mark phone as verified
-      user = await prisma.user.update({
+
+      this.logger.log(`New user created via Apple Sign-in: ${user.id}`);
+    } else {
+      // Update last active
+      await this.prisma.user.update({
         where: { id: user.id },
-        data: { phoneVerified: true },
-        include: { settings: true },
+        data: {
+          lastActiveAt: new Date(),
+          // Update email if it changed and was previously private
+          appleEmail: appleUser.email || user.appleEmail,
+        },
       });
+    }
+
+    // Check if user is banned
+    if (user.isBanned) {
+      throw new UnauthorizedException(
+        user.banReason || 'Your account has been suspended',
+      );
     }
 
     // Register device if provided
-    let deviceId: string | null = null;
-    if (deviceToken && deviceType) {
-      const device = await prisma.userDevice.upsert({
-        where: {
-          userId_deviceToken: {
-            userId: user.id,
-            deviceToken,
-          },
-        },
-        update: {
-          deviceType,
-          deviceName,
-          isActive: true,
-          lastUsedAt: new Date(),
-        },
-        create: {
-          userId: user.id,
-          deviceToken,
-          deviceType,
-          deviceName,
-          isActive: true,
-        },
-      });
-      deviceId = device.id;
+    if (dto.deviceToken && dto.deviceType) {
+      await this.registerDevice({
+        deviceToken: dto.deviceToken,
+        deviceType: dto.deviceType,
+        deviceName: dto.deviceName,
+        deviceModel: dto.deviceModel,
+        osVersion: dto.osVersion,
+        appVersion: dto.appVersion,
+        apnsToken: dto.apnsToken,
+      }, user.id);
     }
 
     // Generate tokens
-    const accessToken = this.generateAccessToken(user);
-    const refreshToken = await this.createRefreshToken(user.id, deviceId);
-
-    // Update last active
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { lastActiveAt: new Date() },
-    });
-
-    // Clear rate limit
-    await cache.del(`otp_rate:${phoneNumber}`);
+    const tokens = await this.generateTokens(user);
 
     return {
-      accessToken,
-      refreshToken,
+      ...tokens,
       user: this.sanitizeUser(user),
+      isNewUser,
     };
   }
 
   /**
    * Refresh access token
    */
-  async refreshAccessToken(
-    refreshToken: string
-  ): Promise<{ accessToken: string; refreshToken: string }> {
-    const tokenHash = hashToken(refreshToken);
+  async refreshToken(dto: RefreshTokenDto): Promise<TokenPair> {
+    // Hash the refresh token to compare with stored hash
+    const tokenHash = await this.hashToken(dto.refreshToken);
 
-    // Find valid refresh token
-    const storedToken = await prisma.refreshToken.findFirst({
+    const storedToken = await this.prisma.refreshToken.findFirst({
       where: {
         tokenHash,
         revokedAt: null,
         expiresAt: { gt: new Date() },
       },
-      include: {
-        user: true,
-      },
+      include: { user: true },
     });
 
     if (!storedToken) {
-      throw new UnauthorizedError('Invalid or expired refresh token');
+      throw new UnauthorizedException('Invalid or expired refresh token');
     }
 
+    // Check if user is banned
     if (storedToken.user.isBanned) {
-      throw new UnauthorizedError('Account suspended');
+      // Revoke all tokens for banned user
+      await this.revokeAllUserTokens(storedToken.user.id);
+      throw new UnauthorizedException('Your account has been suspended');
     }
 
-    // Revoke old token (token rotation)
-    await prisma.refreshToken.update({
+    // Revoke the old refresh token (rotation)
+    await this.prisma.refreshToken.update({
       where: { id: storedToken.id },
       data: { revokedAt: new Date() },
     });
 
     // Generate new tokens
-    const accessToken = this.generateAccessToken(storedToken.user);
-    const newRefreshToken = await this.createRefreshToken(
-      storedToken.userId,
-      storedToken.deviceId
-    );
+    return this.generateTokens(storedToken.user, storedToken.deviceId || undefined);
+  }
 
-    return {
-      accessToken,
-      refreshToken: newRefreshToken,
-    };
+  /**
+   * Register or update device for push notifications
+   */
+  async registerDevice(
+    dto: RegisterDeviceDto,
+    userId: string,
+  ): Promise<void> {
+    await this.prisma.userDevice.upsert({
+      where: {
+        userId_deviceToken: {
+          userId,
+          deviceToken: dto.deviceToken,
+        },
+      },
+      create: {
+        userId,
+        deviceToken: dto.deviceToken,
+        deviceType: dto.deviceType,
+        deviceName: dto.deviceName,
+        deviceModel: dto.deviceModel,
+        osVersion: dto.osVersion,
+        appVersion: dto.appVersion,
+        apnsToken: dto.apnsToken,
+        apnsEnvironment: dto.apnsToken ? 'production' : undefined,
+        lastUsedAt: new Date(),
+      },
+      update: {
+        deviceName: dto.deviceName,
+        deviceModel: dto.deviceModel,
+        osVersion: dto.osVersion,
+        appVersion: dto.appVersion,
+        apnsToken: dto.apnsToken,
+        isActive: true,
+        lastUsedAt: new Date(),
+      },
+    });
   }
 
   /**
    * Logout - revoke refresh token
    */
-  async logout(userId: string, refreshToken?: string): Promise<void> {
-    if (refreshToken) {
-      const tokenHash = hashToken(refreshToken);
-      await prisma.refreshToken.updateMany({
-        where: {
-          userId,
-          tokenHash,
-          revokedAt: null,
-        },
-        data: { revokedAt: new Date() },
-      });
-    }
+  async logout(refreshToken: string, userId: string): Promise<void> {
+    const tokenHash = await this.hashToken(refreshToken);
+
+    await this.prisma.refreshToken.updateMany({
+      where: {
+        userId,
+        tokenHash,
+        revokedAt: null,
+      },
+      data: { revokedAt: new Date() },
+    });
   }
 
   /**
    * Logout from all devices
    */
   async logoutAll(userId: string): Promise<void> {
-    await prisma.refreshToken.updateMany({
-      where: {
-        userId,
-        revokedAt: null,
-      },
-      data: { revokedAt: new Date() },
-    });
-
-    // Deactivate all devices
-    await prisma.userDevice.updateMany({
-      where: { userId },
-      data: { isActive: false },
-    });
+    await this.revokeAllUserTokens(userId);
   }
 
   /**
-   * Generate access token
+   * Validate user for JWT strategy
    */
-  private generateAccessToken(user: { id: string; phoneNumber: string; role: string }): string {
-    const payload: Omit<JWTPayload, 'iat' | 'exp'> = {
-      sub: user.id,
-      phone: user.phoneNumber,
-      role: user.role as JWTPayload['role'],
-    };
+  async validateUser(userId: string): Promise<User | null> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+    });
 
-    return this.fastify.jwt.sign(payload);
-  }
-
-  /**
-   * Create and store refresh token
-   */
-  private async createRefreshToken(
-    userId: string,
-    deviceId: string | null
-  ): Promise<string> {
-    const token = generateToken(48);
-    const tokenHash = hashToken(token);
-
-    // Parse refresh expiry (e.g., "7d" -> 7 days)
-    const expiryMatch = config.jwt.refreshExpiry.match(/^(\d+)([dhms])$/);
-    let expiresAt = new Date();
-    if (expiryMatch) {
-      const value = parseInt(expiryMatch[1] ?? '7', 10);
-      const unit = expiryMatch[2];
-      switch (unit) {
-        case 'd':
-          expiresAt.setDate(expiresAt.getDate() + value);
-          break;
-        case 'h':
-          expiresAt.setHours(expiresAt.getHours() + value);
-          break;
-        case 'm':
-          expiresAt.setMinutes(expiresAt.getMinutes() + value);
-          break;
-        case 's':
-          expiresAt.setSeconds(expiresAt.getSeconds() + value);
-          break;
-      }
-    } else {
-      // Default to 7 days
-      expiresAt.setDate(expiresAt.getDate() + 7);
+    if (!user || user.isBanned) {
+      return null;
     }
 
-    await prisma.refreshToken.create({
+    return user;
+  }
+
+  /**
+   * Generate access and refresh tokens
+   */
+  private async generateTokens(
+    user: User,
+    deviceId?: string,
+  ): Promise<TokenPair> {
+    const payload = {
+      sub: user.id,
+      email: user.email,
+      appleId: user.appleId,
+      role: user.role,
+    };
+
+    const accessToken = this.jwtService.sign(payload);
+
+    // Generate refresh token
+    const refreshToken = this.generateRefreshToken();
+    const tokenHash = await this.hashToken(refreshToken);
+
+    // Calculate expiry
+    const refreshExpiresIn = this.configService.get<string>(
+      'jwt.refreshExpiresIn',
+    ) || '7d';
+    const expiresAt = this.calculateExpiry(refreshExpiresIn);
+
+    // Store refresh token
+    await this.prisma.refreshToken.create({
       data: {
-        userId,
+        userId: user.id,
         tokenHash,
         deviceId,
         expiresAt,
       },
     });
 
-    return token;
+    // Get access token expiry in seconds
+    const accessExpiresIn = this.configService.get<string>(
+      'jwt.accessExpiresIn',
+    ) || '15m';
+    const expiresIn = this.parseExpiryToSeconds(accessExpiresIn);
+
+    return {
+      accessToken,
+      refreshToken,
+      expiresIn,
+    };
+  }
+
+  /**
+   * Generate a secure refresh token
+   */
+  private generateRefreshToken(): string {
+    const { randomBytes } = require('crypto');
+    return randomBytes(64).toString('base64url');
+  }
+
+  /**
+   * Hash a token for storage
+   */
+  private async hashToken(token: string): Promise<string> {
+    const { createHash } = require('crypto');
+    return createHash('sha256').update(token).digest('hex');
+  }
+
+  /**
+   * Calculate expiry date from duration string
+   */
+  private calculateExpiry(duration: string): Date {
+    const seconds = this.parseExpiryToSeconds(duration);
+    return new Date(Date.now() + seconds * 1000);
+  }
+
+  /**
+   * Parse expiry string to seconds
+   */
+  private parseExpiryToSeconds(expiry: string): number {
+    const match = expiry.match(/^(\d+)([smhd])$/);
+    if (!match) return 900; // Default 15 minutes
+
+    const value = parseInt(match[1], 10);
+    const unit = match[2];
+
+    switch (unit) {
+      case 's':
+        return value;
+      case 'm':
+        return value * 60;
+      case 'h':
+        return value * 3600;
+      case 'd':
+        return value * 86400;
+      default:
+        return 900;
+    }
+  }
+
+  /**
+   * Revoke all tokens for a user
+   */
+  private async revokeAllUserTokens(userId: string): Promise<void> {
+    await this.prisma.refreshToken.updateMany({
+      where: {
+        userId,
+        revokedAt: null,
+      },
+      data: { revokedAt: new Date() },
+    });
   }
 
   /**
    * Remove sensitive fields from user object
    */
-  private sanitizeUser(user: {
-    id: string;
-    phoneNumber: string;
-    email: string | null;
-    username: string | null;
-    displayName: string | null;
-    avatarUrl: string | null;
-    role: string;
-    reputationScore: number;
-    createdAt: Date;
-  }): object {
-    return {
-      id: user.id,
-      phoneNumber: user.phoneNumber,
-      email: user.email,
-      username: user.username,
-      displayName: user.displayName,
-      avatarUrl: user.avatarUrl,
-      role: user.role,
-      reputationScore: user.reputationScore,
-      createdAt: user.createdAt,
-    };
+  private sanitizeUser(user: User): Partial<User> {
+    const { appleRefreshToken, ...sanitized } = user;
+    return sanitized;
   }
 }

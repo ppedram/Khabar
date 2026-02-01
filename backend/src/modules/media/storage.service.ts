@@ -1,3 +1,5 @@
+import { Injectable, Logger, BadRequestException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import {
   S3Client,
   PutObjectCommand,
@@ -5,133 +7,248 @@ import {
   GetObjectCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { config } from '../../config/index.js';
-import { logger } from '../../utils/logger.js';
-import { generateId } from '../../utils/crypto.js';
+import { v4 as uuidv4 } from 'uuid';
 
-const s3Client = new S3Client({
-  endpoint: config.s3.endpoint,
-  region: config.s3.region,
-  credentials: {
-    accessKeyId: config.s3.accessKey,
-    secretAccessKey: config.s3.secretKey,
-  },
-  forcePathStyle: true, // Required for MinIO
-});
-
-export interface UploadResult {
-  key: string;
-  url: string;
-  contentType: string;
-  size: number;
+interface UploadOptions {
+  folder?: string;
+  contentType?: string;
+  metadata?: Record<string, string>;
 }
 
+interface PresignedUrlOptions {
+  expiresIn?: number; // seconds
+  contentType?: string;
+}
+
+@Injectable()
 export class StorageService {
+  private readonly logger = new Logger(StorageService.name);
+  private readonly s3Client: S3Client;
+  private readonly bucketName: string;
+  private readonly publicUrl: string;
+
+  constructor(private readonly configService: ConfigService) {
+    const endpoint = this.configService.get<string>('s3.endpoint');
+    const region = this.configService.get<string>('s3.region') || 'us-east-1';
+    const accessKey = this.configService.get<string>('s3.accessKey');
+    const secretKey = this.configService.get<string>('s3.secretKey');
+
+    this.bucketName =
+      this.configService.get<string>('s3.bucketName') || 'khabar-media';
+    this.publicUrl = this.configService.get<string>('s3.publicUrl') || '';
+
+    this.s3Client = new S3Client({
+      endpoint,
+      region,
+      credentials: {
+        accessKeyId: accessKey || '',
+        secretAccessKey: secretKey || '',
+      },
+      forcePathStyle: true, // Required for MinIO
+    });
+  }
+
   /**
-   * Upload a file to S3/MinIO
+   * Upload a file to S3
    */
   async uploadFile(
     buffer: Buffer,
     originalName: string,
-    contentType: string,
-    folder = 'uploads'
-  ): Promise<UploadResult> {
-    const extension = originalName.split('.').pop() ?? 'bin';
-    const key = `${folder}/${generateId()}.${extension}`;
+    options: UploadOptions = {},
+  ): Promise<{ key: string; url: string }> {
+    const extension = this.getExtension(originalName);
+    const folder = options.folder || 'uploads';
+    const key = `${folder}/${uuidv4()}${extension}`;
 
     try {
-      await s3Client.send(
+      await this.s3Client.send(
         new PutObjectCommand({
-          Bucket: config.s3.bucketName,
+          Bucket: this.bucketName,
           Key: key,
           Body: buffer,
-          ContentType: contentType,
-          CacheControl: 'max-age=31536000', // 1 year
-        })
+          ContentType: options.contentType || this.getMimeType(extension),
+          Metadata: options.metadata,
+        }),
       );
 
-      logger.info({ key, size: buffer.length }, 'File uploaded to S3');
+      const url = this.getPublicUrl(key);
+      this.logger.log(`File uploaded: ${key}`);
 
-      return {
-        key,
-        url: `${config.s3.publicUrl}/${key}`,
-        contentType,
-        size: buffer.length,
-      };
+      return { key, url };
     } catch (error) {
-      logger.error({ error, key }, 'Failed to upload file to S3');
-      throw error;
+      this.logger.error('Failed to upload file:', error);
+      throw new BadRequestException('Failed to upload file');
     }
   }
 
   /**
-   * Delete a file from S3/MinIO
+   * Generate a presigned URL for direct upload from iOS app
+   */
+  async getPresignedUploadUrl(
+    fileName: string,
+    options: PresignedUrlOptions = {},
+  ): Promise<{
+    uploadUrl: string;
+    key: string;
+    publicUrl: string;
+    expiresAt: Date;
+  }> {
+    const extension = this.getExtension(fileName);
+    const folder = this.getFolderForType(options.contentType);
+    const key = `${folder}/${uuidv4()}${extension}`;
+
+    const expiresIn = options.expiresIn || 3600; // Default 1 hour
+
+    try {
+      const command = new PutObjectCommand({
+        Bucket: this.bucketName,
+        Key: key,
+        ContentType: options.contentType,
+      });
+
+      const uploadUrl = await getSignedUrl(this.s3Client, command, {
+        expiresIn,
+      });
+
+      const publicUrl = this.getPublicUrl(key);
+      const expiresAt = new Date(Date.now() + expiresIn * 1000);
+
+      return {
+        uploadUrl,
+        key,
+        publicUrl,
+        expiresAt,
+      };
+    } catch (error) {
+      this.logger.error('Failed to generate presigned URL:', error);
+      throw new BadRequestException('Failed to generate upload URL');
+    }
+  }
+
+  /**
+   * Generate a presigned URL for downloading private content
+   */
+  async getPresignedDownloadUrl(
+    key: string,
+    expiresIn = 3600,
+  ): Promise<string> {
+    try {
+      const command = new GetObjectCommand({
+        Bucket: this.bucketName,
+        Key: key,
+      });
+
+      return await getSignedUrl(this.s3Client, command, { expiresIn });
+    } catch (error) {
+      this.logger.error('Failed to generate download URL:', error);
+      throw new BadRequestException('Failed to generate download URL');
+    }
+  }
+
+  /**
+   * Delete a file from S3
    */
   async deleteFile(key: string): Promise<void> {
     try {
-      await s3Client.send(
+      await this.s3Client.send(
         new DeleteObjectCommand({
-          Bucket: config.s3.bucketName,
+          Bucket: this.bucketName,
           Key: key,
-        })
+        }),
       );
-
-      logger.info({ key }, 'File deleted from S3');
+      this.logger.log(`File deleted: ${key}`);
     } catch (error) {
-      logger.error({ error, key }, 'Failed to delete file from S3');
-      throw error;
+      this.logger.error('Failed to delete file:', error);
+      throw new BadRequestException('Failed to delete file');
     }
   }
 
   /**
-   * Generate a presigned URL for direct upload
+   * Validate file type for iOS media
    */
-  async getUploadUrl(
-    key: string,
+  validateFileType(
     contentType: string,
-    expiresIn = 3600
-  ): Promise<string> {
-    const command = new PutObjectCommand({
-      Bucket: config.s3.bucketName,
-      Key: key,
-      ContentType: contentType,
-    });
+    type: 'image' | 'video',
+  ): boolean {
+    const allowedImages = this.configService.get<string[]>(
+      'media.allowedImageTypes',
+    ) || ['image/jpeg', 'image/png', 'image/heic', 'image/heif'];
 
-    return getSignedUrl(s3Client, command, { expiresIn });
+    const allowedVideos = this.configService.get<string[]>(
+      'media.allowedVideoTypes',
+    ) || ['video/mp4', 'video/quicktime', 'video/x-m4v'];
+
+    if (type === 'image') {
+      return allowedImages.includes(contentType);
+    }
+
+    return allowedVideos.includes(contentType);
   }
 
   /**
-   * Generate a presigned URL for download
+   * Validate file size
    */
-  async getDownloadUrl(key: string, expiresIn = 3600): Promise<string> {
-    const command = new GetObjectCommand({
-      Bucket: config.s3.bucketName,
-      Key: key,
-    });
+  validateFileSize(sizeBytes: number, type: 'image' | 'video'): boolean {
+    const maxImageMb =
+      this.configService.get<number>('media.maxImageSizeMb') || 10;
+    const maxVideoMb =
+      this.configService.get<number>('media.maxVideoSizeMb') || 100;
 
-    return getSignedUrl(s3Client, command, { expiresIn });
+    const maxBytes =
+      type === 'image' ? maxImageMb * 1024 * 1024 : maxVideoMb * 1024 * 1024;
+
+    return sizeBytes <= maxBytes;
   }
 
   /**
-   * Get the public URL for a file
+   * Get public URL for a key
    */
-  getPublicUrl(key: string): string {
-    return `${config.s3.publicUrl}/${key}`;
+  private getPublicUrl(key: string): string {
+    if (this.publicUrl) {
+      return `${this.publicUrl}/${key}`;
+    }
+    const endpoint = this.configService.get<string>('s3.endpoint');
+    return `${endpoint}/${this.bucketName}/${key}`;
   }
 
   /**
-   * Validate file type
+   * Get file extension
    */
-  isAllowedImageType(contentType: string): boolean {
-    const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-    return allowed.includes(contentType);
+  private getExtension(fileName: string): string {
+    const parts = fileName.split('.');
+    if (parts.length > 1) {
+      return `.${parts[parts.length - 1].toLowerCase()}`;
+    }
+    return '';
   }
 
   /**
-   * Validate video type
+   * Get MIME type from extension
    */
-  isAllowedVideoType(contentType: string): boolean {
-    const allowed = ['video/mp4', 'video/webm', 'video/quicktime'];
-    return allowed.includes(contentType);
+  private getMimeType(extension: string): string {
+    const mimeTypes: Record<string, string> = {
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png',
+      '.heic': 'image/heic',
+      '.heif': 'image/heif',
+      '.mp4': 'video/mp4',
+      '.mov': 'video/quicktime',
+      '.m4v': 'video/x-m4v',
+    };
+    return mimeTypes[extension] || 'application/octet-stream';
+  }
+
+  /**
+   * Get folder based on content type
+   */
+  private getFolderForType(contentType?: string): string {
+    if (contentType?.startsWith('image/')) {
+      return 'images';
+    }
+    if (contentType?.startsWith('video/')) {
+      return 'videos';
+    }
+    return 'uploads';
   }
 }

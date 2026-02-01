@@ -1,223 +1,374 @@
-import { prisma } from '../../config/database.js';
-import { getSkip, paginate, type PaginationParams } from '../../utils/pagination.js';
-import { NotFoundError } from '../../utils/errors.js';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { ApnsService, APNsCategory, APNsSound } from './apns.service';
+import { Incident, NotificationType } from '@prisma/client';
 
-export class NotificationService {
+interface NotificationPayload {
+  type: NotificationType;
+  incidentId?: string;
+  title: string;
+  body: string;
+  data?: Record<string, unknown>;
+}
+
+@Injectable()
+export class NotificationsService {
+  private readonly logger = new Logger(NotificationsService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly apnsService: ApnsService,
+  ) {}
+
   /**
-   * Get user notifications
+   * Send notification for a nearby incident
    */
-  async getNotifications(userId: string, pagination: PaginationParams) {
-    const [notifications, total] = await Promise.all([
-      prisma.notification.findMany({
-        where: { userId },
+  async sendNearbyIncidentNotification(
+    userId: string,
+    incident: Incident,
+    apnsToken?: string,
+  ): Promise<void> {
+    const notification = await this.createNotificationRecord({
+      userId,
+      incidentId: incident.id,
+      type: NotificationType.NEARBY_INCIDENT,
+      title: 'Nearby Incident Reported',
+      body: incident.title,
+      data: {
+        incidentId: incident.id,
+        latitude: Number(incident.latitude),
+        longitude: Number(incident.longitude),
+        severity: incident.severity,
+      },
+    });
+
+    if (apnsToken) {
+      await this.sendApnsNotification(notification.id, apnsToken, {
+        title: 'Nearby Incident Reported',
+        body: incident.title,
+        category: APNsCategory.NEARBY_INCIDENT,
+        sound: this.getSoundForSeverity(incident.severity),
+        data: {
+          notificationId: notification.id,
+          incidentId: incident.id,
+          type: 'NEARBY_INCIDENT',
+        },
+        threadId: `incident-${incident.id}`,
+      });
+    }
+  }
+
+  /**
+   * Send notification when an incident is verified
+   */
+  async sendIncidentVerifiedNotification(
+    incident: Incident,
+  ): Promise<void> {
+    // Notify the incident creator
+    const device = await this.prisma.userDevice.findFirst({
+      where: {
+        userId: incident.userId,
+        isActive: true,
+        deviceType: 'IOS',
+        apnsToken: { not: null },
+      },
+    });
+
+    const notification = await this.createNotificationRecord({
+      userId: incident.userId,
+      incidentId: incident.id,
+      type: NotificationType.VERIFICATION,
+      title: 'Your Incident Was Verified',
+      body: `"${incident.title}" has been verified by the community`,
+      data: { incidentId: incident.id },
+    });
+
+    if (device?.apnsToken) {
+      await this.sendApnsNotification(notification.id, device.apnsToken, {
+        title: 'Your Incident Was Verified',
+        body: `"${incident.title}" has been verified by the community`,
+        category: APNsCategory.INCIDENT_VERIFIED,
+        sound: APNsSound.DEFAULT,
+        data: {
+          notificationId: notification.id,
+          incidentId: incident.id,
+          type: 'INCIDENT_VERIFIED',
+        },
+      });
+    }
+  }
+
+  /**
+   * Send notification for a comment
+   */
+  async sendCommentNotification(
+    userId: string,
+    incidentId: string,
+    commentPreview: string,
+    commenterName: string,
+  ): Promise<void> {
+    const device = await this.prisma.userDevice.findFirst({
+      where: {
+        userId,
+        isActive: true,
+        deviceType: 'IOS',
+        apnsToken: { not: null },
+      },
+    });
+
+    const notification = await this.createNotificationRecord({
+      userId,
+      incidentId,
+      type: NotificationType.COMMENT,
+      title: `New comment from ${commenterName}`,
+      body: commentPreview,
+      data: { incidentId },
+    });
+
+    if (device?.apnsToken) {
+      await this.sendApnsNotification(notification.id, device.apnsToken, {
+        title: `New comment from ${commenterName}`,
+        body: commentPreview,
+        category: APNsCategory.COMMENT,
+        sound: APNsSound.DEFAULT,
+        data: {
+          notificationId: notification.id,
+          incidentId,
+          type: 'COMMENT',
+        },
+        threadId: `incident-${incidentId}`,
+      });
+    }
+  }
+
+  /**
+   * Send a system notification
+   */
+  async sendSystemNotification(
+    userId: string,
+    title: string,
+    body: string,
+    data?: Record<string, unknown>,
+  ): Promise<void> {
+    const device = await this.prisma.userDevice.findFirst({
+      where: {
+        userId,
+        isActive: true,
+        deviceType: 'IOS',
+        apnsToken: { not: null },
+      },
+    });
+
+    const notification = await this.createNotificationRecord({
+      userId,
+      type: NotificationType.SYSTEM,
+      title,
+      body,
+      data,
+    });
+
+    if (device?.apnsToken) {
+      await this.sendApnsNotification(notification.id, device.apnsToken, {
+        title,
+        body,
+        category: APNsCategory.SYSTEM,
+        sound: APNsSound.DEFAULT,
+        data: {
+          notificationId: notification.id,
+          type: 'SYSTEM',
+          ...data,
+        },
+      });
+    }
+  }
+
+  /**
+   * Get user's notifications
+   */
+  async getNotifications(
+    userId: string,
+    limit = 20,
+    offset = 0,
+    unreadOnly = false,
+  ) {
+    const where = {
+      userId,
+      ...(unreadOnly ? { isRead: false } : {}),
+    };
+
+    const [notifications, total, unreadCount] = await Promise.all([
+      this.prisma.notification.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        skip: offset,
         include: {
           incident: {
             select: {
               id: true,
               title: true,
+              status: true,
+              severity: true,
               latitude: true,
               longitude: true,
-              category: {
-                select: {
-                  name: true,
-                  icon: true,
-                  color: true,
-                },
-              },
             },
           },
         },
-        orderBy: { createdAt: 'desc' },
-        skip: getSkip(pagination.page, pagination.limit),
-        take: pagination.limit,
       }),
-      prisma.notification.count({ where: { userId } }),
+      this.prisma.notification.count({ where }),
+      this.prisma.notification.count({ where: { userId, isRead: false } }),
     ]);
 
-    return paginate(notifications, total, pagination);
-  }
-
-  /**
-   * Get unread notification count
-   */
-  async getUnreadCount(userId: string) {
-    const count = await prisma.notification.count({
-      where: { userId, isRead: false },
-    });
-
-    return { unreadCount: count };
+    return {
+      notifications,
+      total,
+      unreadCount,
+    };
   }
 
   /**
    * Mark notification as read
    */
-  async markAsRead(notificationId: string, userId: string) {
-    const notification = await prisma.notification.findFirst({
-      where: { id: notificationId, userId },
+  async markAsRead(notificationId: string, userId: string): Promise<void> {
+    const notification = await this.prisma.notification.findUnique({
+      where: { id: notificationId },
     });
 
-    if (!notification) {
-      throw new NotFoundError('Notification not found');
+    if (!notification || notification.userId !== userId) {
+      throw new NotFoundException('Notification not found');
     }
 
-    return prisma.notification.update({
+    await this.prisma.notification.update({
       where: { id: notificationId },
-      data: { isRead: true },
+      data: {
+        isRead: true,
+        readAt: new Date(),
+      },
     });
   }
 
   /**
    * Mark all notifications as read
    */
-  async markAllAsRead(userId: string) {
-    await prisma.notification.updateMany({
+  async markAllAsRead(userId: string): Promise<{ count: number }> {
+    const result = await this.prisma.notification.updateMany({
       where: { userId, isRead: false },
-      data: { isRead: true },
+      data: {
+        isRead: true,
+        readAt: new Date(),
+      },
     });
 
-    return { message: 'All notifications marked as read' };
+    return { count: result.count };
   }
 
   /**
    * Delete a notification
    */
-  async deleteNotification(notificationId: string, userId: string) {
-    const notification = await prisma.notification.findFirst({
-      where: { id: notificationId, userId },
+  async deleteNotification(notificationId: string, userId: string): Promise<void> {
+    const notification = await this.prisma.notification.findUnique({
+      where: { id: notificationId },
     });
 
-    if (!notification) {
-      throw new NotFoundError('Notification not found');
+    if (!notification || notification.userId !== userId) {
+      throw new NotFoundException('Notification not found');
     }
 
-    await prisma.notification.delete({
+    await this.prisma.notification.delete({
       where: { id: notificationId },
     });
   }
 
   /**
-   * Create a notification (internal use)
+   * Create notification record in database
    */
-  async createNotification(data: {
-    userId: string;
-    incidentId?: string;
-    type: 'NEARBY_INCIDENT' | 'COMMENT' | 'UPDATE' | 'VERIFICATION' | 'SYSTEM';
-    title: string;
-    body?: string;
-    data?: Record<string, unknown>;
-  }) {
-    return prisma.notification.create({
+  private async createNotificationRecord(
+    payload: NotificationPayload & { userId: string },
+  ) {
+    return this.prisma.notification.create({
       data: {
-        userId: data.userId,
-        incidentId: data.incidentId,
-        type: data.type,
-        title: data.title,
-        body: data.body,
-        data: data.data ?? {},
+        userId: payload.userId,
+        incidentId: payload.incidentId,
+        type: payload.type,
+        title: payload.title,
+        body: payload.body,
+        data: payload.data,
+        apnsCategory: this.getApnsCategory(payload.type),
       },
     });
   }
 
   /**
-   * Create notifications for users near an incident
+   * Send APNs notification and update record
    */
-  async notifyNearbyUsers(
-    incidentId: string,
-    latitude: number,
-    longitude: number,
-    radiusKm: number,
-    excludeUserId?: string
-  ) {
-    // Find users with home location near the incident
-    // This is a simplified version - in production, you'd use PostGIS
-    const users = await prisma.userSettings.findMany({
-      where: {
-        notificationsEnabled: true,
-        homeLocationLat: { not: null },
-        homeLocationLng: { not: null },
-        ...(excludeUserId ? { userId: { not: excludeUserId } } : {}),
-      },
-      include: {
-        user: {
-          select: {
-            id: true,
-            isBanned: true,
-          },
-        },
+  private async sendApnsNotification(
+    notificationId: string,
+    apnsToken: string,
+    options: {
+      title: string;
+      body: string;
+      category: APNsCategory;
+      sound: APNsSound | string;
+      data: Record<string, unknown>;
+      threadId?: string;
+    },
+  ): Promise<void> {
+    const result = await this.apnsService.send(apnsToken, {
+      title: options.title,
+      body: options.body,
+      category: options.category,
+      sound: options.sound,
+      data: options.data,
+      threadId: options.threadId,
+      mutableContent: true,
+    });
+
+    // Update notification record with send status
+    await this.prisma.notification.update({
+      where: { id: notificationId },
+      data: {
+        isSent: result.success,
+        sentAt: result.success ? new Date() : undefined,
+        apnsId: result.apnsId,
+        failReason: result.error,
       },
     });
 
-    const notifications = [];
-
-    for (const settings of users) {
-      if (settings.user.isBanned) continue;
-      if (!settings.homeLocationLat || !settings.homeLocationLng) continue;
-
-      // Calculate distance
-      const distance = this.calculateDistance(
-        latitude,
-        longitude,
-        Number(settings.homeLocationLat),
-        Number(settings.homeLocationLng)
-      );
-
-      // Check if within user's notification radius
-      const userRadius = Number(settings.notificationRadiusKm);
-      if (distance <= userRadius) {
-        notifications.push({
-          userId: settings.userId,
-          incidentId,
-        });
-      }
-    }
-
-    // Create notifications in batch
-    if (notifications.length > 0) {
-      const incident = await prisma.incident.findUnique({
-        where: { id: incidentId },
-        include: { category: true },
+    // Handle invalid tokens
+    if (result.error === 'INVALID_TOKEN') {
+      await this.prisma.userDevice.updateMany({
+        where: { apnsToken },
+        data: { isActive: false, apnsToken: null },
       });
-
-      if (incident) {
-        await prisma.notification.createMany({
-          data: notifications.map((n) => ({
-            userId: n.userId,
-            incidentId: n.incidentId,
-            type: 'NEARBY_INCIDENT' as const,
-            title: `New ${incident.category.name} incident nearby`,
-            body: incident.title,
-            data: {
-              incidentId,
-              categorySlug: incident.category.slug,
-            },
-          })),
-        });
-      }
+      this.logger.warn(`Deactivated invalid APNs token: ${apnsToken.substring(0, 10)}...`);
     }
-
-    return { notifiedCount: notifications.length };
   }
 
-  private calculateDistance(
-    lat1: number,
-    lng1: number,
-    lat2: number,
-    lng2: number
-  ): number {
-    const R = 6371; // Earth's radius in km
-    const dLat = this.toRad(lat2 - lat1);
-    const dLng = this.toRad(lng2 - lng1);
-    const a =
-      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-      Math.cos(this.toRad(lat1)) *
-        Math.cos(this.toRad(lat2)) *
-        Math.sin(dLng / 2) *
-        Math.sin(dLng / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return R * c;
+  /**
+   * Get APNs category for notification type
+   */
+  private getApnsCategory(type: NotificationType): string {
+    const categories: Record<NotificationType, APNsCategory> = {
+      [NotificationType.NEARBY_INCIDENT]: APNsCategory.NEARBY_INCIDENT,
+      [NotificationType.UPDATE]: APNsCategory.INCIDENT_UPDATE,
+      [NotificationType.VERIFICATION]: APNsCategory.INCIDENT_VERIFIED,
+      [NotificationType.COMMENT]: APNsCategory.COMMENT,
+      [NotificationType.SYSTEM]: APNsCategory.SYSTEM,
+    };
+    return categories[type];
   }
 
-  private toRad(deg: number): number {
-    return deg * (Math.PI / 180);
+  /**
+   * Get sound based on incident severity
+   */
+  private getSoundForSeverity(severity: string): APNsSound {
+    switch (severity) {
+      case 'CRITICAL':
+        return APNsSound.CRITICAL;
+      case 'HIGH':
+        return APNsSound.ALERT;
+      default:
+        return APNsSound.DEFAULT;
+    }
   }
 }
